@@ -1,6 +1,6 @@
 # Modrinth page is under review
 
-# Beyond the Horizon
+# Beyond the Terrain
 
 See mountains, trees, rivers and coastlines far past your render distance, with a small performance cost. Made for low-end computers
 
