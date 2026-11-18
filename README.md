@@ -40,4 +40,4 @@ The distant terrain is heightmap based, so there are no structures or caves yet(
 
 ## Disclosure
 
-Full disclosure, AI was used as a tool in the process of rewriting certain portions of this mod that were completely bugged in the original mod and no assets/art or texts were generated i had to create them.
+Full disclosure, AI was used as a tool in the process of rewriting certain portions of this mod that were completely bugged in the original mod and no assets/art or texts were generated since i know how to make them.
