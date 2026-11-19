@@ -24,7 +24,7 @@ public final class ClientConfig {
     public static final int FOG_OFF = 3;
 
     public static final int MIN_DISTANCE_CHUNKS = 24;
-    public static final int MAX_DISTANCE_CHUNKS = 1024;
+    public static final int MAX_DISTANCE_CHUNKS = 10000;
 
     public boolean enabled = true;
     /** How far the terrain is drawn, in chunks. */
@@ -47,7 +47,7 @@ public final class ClientConfig {
     public int treeDensity = 100;
     /** Trees on tiles with a sample spacing of 2 to this power blocks or more are one billboard sprite instead of boxes; 5 is off (no tree tiles are coarser). */
     public int treeBillboardLevel = 2;
-    /** Tiles with a sample spacing up to 2 to this power in blocks are drawn as stepped columns (flat tops, walls between them) instead of the smooth ground; 0 is off. */
+    /** Tiles with a sample spacing up to 2 to this power in blocks are drawn as stepped columns (flat tops, walls between them) instead of the smooth ground; 0 is one block per column, -1 is off. */
     public int stepLevel = 3;
     /** How far the distant structures (villages and the like, as rough boxes) are drawn, in steps of 256 blocks; 0 is off. */
     public int structureRange = 8;
@@ -94,7 +94,7 @@ public final class ClientConfig {
                 config.treeLevel = number(p, "treeLevel", config.treeLevel);
                 config.treeDensity = number(p, "treeDensity", config.treeDensity);
                 config.treeBillboardLevel = number(p, "treeBillboardLevel", config.treeBillboardLevel);
-                config.stepLevel = number(p, "stepLevel", config.stepLevel);
+                config.stepLevel = number(p, "stepSpacing", config.stepLevel);
                 config.structureRange = number(p, "structureRange", config.structureRange);
             } catch (IOException | RuntimeException e) {
                 LOGGER.warn("Could not read {}, using defaults", path, e);
@@ -114,7 +114,7 @@ public final class ClientConfig {
 
     public void clamp() {
         this.distanceChunks = Mth.clamp(this.distanceChunks, MIN_DISTANCE_CHUNKS, MAX_DISTANCE_CHUNKS);
-        this.startLevel = Mth.clamp(this.startLevel, 1, 6);
+        this.startLevel = Mth.clamp(this.startLevel, 0, 6);
         this.sharpness = Mth.clamp(this.sharpness, 10, 80);
         this.maxTiles = Mth.clamp(this.maxTiles, 200, 20000);
         this.fogMode = Mth.clamp(this.fogMode, 0, 3);
@@ -123,7 +123,7 @@ public final class ClientConfig {
         this.treeLevel = Mth.clamp(this.treeLevel, 0, 4);
         this.treeDensity = Mth.clamp(this.treeDensity, 10, 200);
         this.treeBillboardLevel = Mth.clamp(this.treeBillboardLevel, 0, 5);
-        this.stepLevel = Mth.clamp(this.stepLevel, 0, 4);
+        this.stepLevel = Mth.clamp(this.stepLevel, -1, 4);
         this.structureRange = Mth.clamp(this.structureRange, 0, 32);
     }
 
@@ -141,7 +141,7 @@ public final class ClientConfig {
         p.setProperty("treeLevel", Integer.toString(this.treeLevel));
         p.setProperty("treeDensity", Integer.toString(this.treeDensity));
         p.setProperty("treeBillboardLevel", Integer.toString(this.treeBillboardLevel));
-        p.setProperty("stepLevel", Integer.toString(this.stepLevel));
+        p.setProperty("stepSpacing", Integer.toString(this.stepLevel));
         p.setProperty("structureRange", Integer.toString(this.structureRange));
         try (Writer out = Files.newBufferedWriter(path())) {
             p.store(out, "Beyond the Terrain client settings");

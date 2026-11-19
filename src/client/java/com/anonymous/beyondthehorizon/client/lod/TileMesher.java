@@ -141,7 +141,7 @@ public final class TileMesher {
         TreePlanter.Trees trees = treeLevel > 0 && spacing <= 1 << treeLevel
             ? TreePlanter.plant(data, pos, spacing, ground, voids, water, colors, treeDensity, palette, billboardLevel < 5 && spacing >= 1 << billboardLevel)
             : null;
-        return MeshBuilder.build(new MeshBuilder.Input(spacing, ground, colors, voids, anyWater ? water : null, waterColors, waterLevel, trees, stepLevel > 0 && spacing <= 1 << stepLevel));
+        return MeshBuilder.build(new MeshBuilder.Input(spacing, ground, colors, voids, anyWater ? water : null, waterColors, waterLevel, trees, stepLevel >= 0 && spacing <= 1 << stepLevel));
     }
 
     /** The block the server's surface rules put on sample {@code i}, or null when the tile does not say. */

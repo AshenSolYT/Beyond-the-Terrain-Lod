@@ -10,7 +10,7 @@
   "beyondthehorizon.options.enabled": "Далёкая местность",
   "beyondthehorizon.options.enabled.tooltip": "Рисует местность за дальностью прорисовки. Мод нужен и на сервере (в одиночной игре достаточно клиента).",
   "beyondthehorizon.options.distance": "Дальность (чанки)",
-  "beyondthehorizon.options.distance.tooltip": "Как далеко рисуется местность, в чанках (24 - 1024). Введите число. Туман кончается на этой дальности.",
+  "beyondthehorizon.options.distance.tooltip": "Как далеко рисуется местность, в чанках (24 - 10000). Введите число. Туман кончается на этой дальности.",
   "beyondthehorizon.options.blocks": "блоков",
   "beyondthehorizon.options.sharpness": "Чёткость",
   "beyondthehorizon.options.sharpness.tooltip": "Как далеко используются более мелкие плитки. Выше — чётче и медленнее.",

@@ -77,14 +77,14 @@ public class LodConfigScreen extends OptionsSubScreen {
         this.distanceBox.setTooltip(Tooltip.create(Component.translatable(PREFIX + "distance.tooltip")));
         this.list.addSmall(distanceLabel, this.distanceBox);
         this.list.addBig(slider("sharpness", 10, 80, c.sharpness, v -> Component.literal(String.format(Locale.ROOT, "%.1f", v / 10.0)), v -> c.sharpness = v));
-        this.list.addBig(slider("start_level", 1, 6, c.startLevel, v -> Component.literal(Integer.toString(1 << v)), v -> c.startLevel = v));
+        this.list.addBig(slider("start_level", 0, 6, c.startLevel, v -> Component.literal(Integer.toString(1 << v)), v -> c.startLevel = v));
         this.list.addBig(slider("max_tiles", 200, 6000, c.maxTiles, v -> Component.literal(number(v) + " " + Component.translatable(PREFIX + "tiles").getString()), v -> c.maxTiles = v / 100 * 100));
         this.list.addBig(slider("fog_mode", 0, 3, c.fogMode, v -> Component.translatable(PREFIX + "fog_mode." + v), v -> c.fogMode = v));
         this.list.addBig(slider("fog_start", 0, 99, c.fogStartPercent, v -> Component.literal(v + " %"), v -> c.fogStartPercent = v));
         // 0 off, then 2x2, 4x4 and 8x8.
         this.list.addBig(slider("pixel_filter", 0, 3, c.pixelFilter == 0 ? 0 : Integer.numberOfTrailingZeros(c.pixelFilter),
             v -> v == 0 ? Component.translatable(PREFIX + "off") : Component.literal((1 << v) + "x" + (1 << v)), v -> c.pixelFilter = v == 0 ? 0 : 1 << v));
-        this.list.addBig(slider("step_level", 0, 4, c.stepLevel, v -> v == 0 ? Component.translatable(PREFIX + "off") : Component.literal((1 << v) + " " + Component.translatable(PREFIX + "blocks").getString()), v -> c.stepLevel = v));
+        this.list.addBig(slider("step_level", 0, 5, c.stepLevel + 1, v -> v == 0 ? Component.translatable(PREFIX + "off") : Component.literal((1 << (v - 1)) + " " + Component.translatable(PREFIX + "blocks").getString()), v -> c.stepLevel = v - 1));
         this.list.addBig(slider("tree_level", 0, 4, c.treeLevel, v -> v == 0 ? Component.translatable(PREFIX + "off") : Component.literal((1 << v) + " " + Component.translatable(PREFIX + "blocks").getString()), v -> c.treeLevel = v));
         this.list.addBig(slider("tree_density", 10, 200, c.treeDensity, v -> Component.literal(v + " %"), v -> c.treeDensity = v));
         this.list.addBig(slider("tree_billboard", 0, 5, c.treeBillboardLevel, v -> v == 5 ? Component.translatable(PREFIX + "off") : Component.literal((1 << v) + " " + Component.translatable(PREFIX + "blocks").getString()), v -> c.treeBillboardLevel = v));

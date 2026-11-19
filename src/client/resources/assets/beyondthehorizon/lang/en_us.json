@@ -10,7 +10,7 @@
   "beyondthehorizon.options.enabled": "Distant terrain",
   "beyondthehorizon.options.enabled.tooltip": "Draws terrain beyond the render distance. Needs the mod on the server too (singleplayer: the client is enough).",
   "beyondthehorizon.options.distance": "Distance (chunks)",
-  "beyondthehorizon.options.distance.tooltip": "How far the terrain is drawn, in chunks (24 - 1024). Type a number. The fog ends at this distance.",
+  "beyondthehorizon.options.distance.tooltip": "How far the terrain is drawn, in chunks (24 - 10000). Type a number. The fog ends at this distance.",
   "beyondthehorizon.options.blocks": "blocks",
   "beyondthehorizon.options.sharpness": "Sharpness",
   "beyondthehorizon.options.sharpness.tooltip": "How far out finer tiles are used. Higher is sharper and slower.",
