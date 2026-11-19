@@ -22,9 +22,11 @@ See your terrain well... beyond your terrain with a performance cost that depend
 ## Future plans
 
 - Faster terrain generation
-- Higher detail when using a spyglass or a zoom mod
-- Trees that match the real tree placement
+- Better stepped terrain detail
+- Block textures in the LOD
+- Higher detail when zooming in with a spyglass or a zoom mod
 - Cave generation
+- Trees that match the real tree placement
 - Shader pack support (idk yet)
 - Flashback compatibility (hopefully)
 
