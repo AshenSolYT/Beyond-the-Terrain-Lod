@@ -31,9 +31,9 @@ See your terrain well... beyond your terrain with a performance cost that depend
 
 * [x] Faster terrain generation
 * [ ] Shader pack support *(hopefully will work)*
-* [ ] Better stepped terrain detail
-* [ ] Higher detail when zooming in with a spyglass or a zoom mod
-* [ ] Terrain colors need to be reworked to be a little more accurate
+* [x] Better stepped terrain detail
+* [x] Higher detail when zooming in with a spyglass or a zoom mod
+* [x] Terrain colors need to be reworked to be a little more accurate
 * [ ] Block textures in the LOD
 * [ ] Cave generation
 * [ ] Trees that match the real tree placement
