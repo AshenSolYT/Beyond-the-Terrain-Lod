@@ -27,7 +27,7 @@ See your terrain well... beyond your terrain with a performance cost that depend
 
 ---
 
-## Future plans in order
+## Roadmap
 
 * [x] Faster terrain generation
 * [ ] Shader pack support *(hopefully will work)*
