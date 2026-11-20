@@ -62,7 +62,8 @@ The mod also has to be installed on the server for the distant terrain to show o
 
 ---
 
-## Full Disclosure
+## AI Disclosure
 
-AI was used to rewrite this mod’s code, because the original mod was pretty bugged by me manually patching it.  
-All assets/art and texts were made by me, not AI generated.
+Full Disclosure AI was used to rewrite this mods code because the original mod was pretty bugged by me manually patching it.
+All assets/art and texts were made by me, not ai generated.
+All builds released is manually compiled and tested by me so there's no issues.
