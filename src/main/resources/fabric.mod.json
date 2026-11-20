@@ -1,0 +1,52 @@
+{
+  "schemaVersion": 1,
+  "id": "beyondthehorizon",
+  "version": "${version}",
+  "name": "Beyond the Terrain",
+  "description": "A custom fork of a level of detail mod that prioritizes performance and compatibility on older hardware as much as possible.",
+  "authors": [
+    "AshenVA"
+  ],
+  "license": "MIT",
+  "contact": {
+    "homepage": "https://modrinth.com/project/WWljWXcn",
+    "sources": "https://github.com/AshenSolYT/Beyond-the-Terrain-Lod",
+    "issues": "https://github.com/AshenSolYT/Beyond-the-Terrain-Lod/issues"
+  },
+  "custom": {
+    "modmenu": {
+      "links": {
+        "modmenu.youtube": "https://www.youtube.com/@TheOnlyAshen"
+      }
+    }
+  },
+  "icon": "assets/beyondthehorizon/icon.png",
+  "environment": "*",
+  "entrypoints": {
+    "main": [
+      "com.anonymous.beyondthehorizon.BeyondTheHorizon"
+    ],
+    "client": [
+      "com.anonymous.beyondthehorizon.client.BeyondTheHorizonClient"
+    ],
+    "modmenu": [
+      "com.anonymous.beyondthehorizon.client.BeyondTheHorizonModMenu"
+    ]
+  },
+  "mixins": [
+    "beyondthehorizon.mixins.json",
+    {
+      "config": "beyondthehorizon.client.mixins.json",
+      "environment": "client"
+    }
+  ],
+  "depends": {
+    "fabricloader": ">=0.19.5",
+    "fabric-api": "*",
+    "minecraft": "~26.3",
+    "java": ">=25"
+  },
+  "suggests": {
+    "modmenu": "*"
+  }
+}
