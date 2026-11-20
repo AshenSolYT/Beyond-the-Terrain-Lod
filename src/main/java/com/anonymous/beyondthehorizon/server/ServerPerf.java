@@ -109,6 +109,20 @@ final class ServerPerf {
             STOP_DETAIL_LIMIT.getAndSet(0L), STOP_VIRTUAL_BUSY.getAndSet(0L)));
     }
 
+    /** Whether nothing happened since the last line: no tiles queued, no surface searches, and the tile threads did not run. */
+    static boolean idle(int roughQueued, int detailQueued) {
+        return roughQueued == 0 && detailQueued == 0 && SURFACE_SEARCHES.get() == 0L && ROUGH.window.get() == 0L && DETAIL.window.get() == 0L;
+    }
+
+    /** Starts the next window of the thread lines when nothing was written, so the next line does not average over the idle time. */
+    static void skipWindow() {
+        lastSummary = System.nanoTime();
+        IN_FLIGHT_TICKS.set(0L);
+        ROUGH_IN_FLIGHT.set(0L);
+        DETAIL_IN_FLIGHT.set(0L);
+        DETAIL_LIMIT.set(0L);
+    }
+
     static void summary(double serverTickMs, int roughQueued, int detailQueued) {
         StringBuilder line = new StringBuilder(256);
         boolean any = false;

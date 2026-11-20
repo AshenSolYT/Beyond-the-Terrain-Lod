@@ -3,15 +3,22 @@
   "id": "beyondthehorizon",
   "version": "${version}",
   "name": "Beyond the Terrain",
-  "description": "A Level-of-detail mod that goes at max of 1024 chunks. Based on FarPlaneTwo Continuation, a continuation of the idea of FarPlaneTwo by DaPorkchop_. Needs at a minimum OpenGL 3.3. Install on both the client and the server; in singleplayer the client is enough.",
+  "description": "A custom fork of a level of detail mod that prioritizes performance and compatibility on older hardware as much as possible.",
   "authors": [
     "AshenVA"
   ],
   "license": "MIT",
   "contact": {
-    "homepage": "https://modrinth.com/mod/beyond-the-terrain",
+    "homepage": "https://modrinth.com/project/WWljWXcn",
     "sources": "https://github.com/AshenSolYT/Beyond-the-Terrain-Lod",
-    "youtube": "https://www.youtube.com/@TheOnlyAshen"
+    "issues": "https://github.com/AshenSolYT/Beyond-the-Terrain-Lod/issues"
+  },
+  "custom": {
+    "modmenu": {
+      "links": {
+        "modmenu.youtube": "https://www.youtube.com/@TheOnlyAshen"
+      }
+    }
   },
   "icon": "assets/beyondthehorizon/icon.png",
   "environment": "*",
@@ -34,9 +41,9 @@
     }
   ],
   "depends": {
-    "fabricloader": ">=${loader_version}",
+    "fabricloader": ">=0.19.5",
     "fabric-api": "*",
-    "minecraft": "~${minecraft_version}",
+    "minecraft": "~26.3",
     "java": ">=25"
   },
   "suggests": {

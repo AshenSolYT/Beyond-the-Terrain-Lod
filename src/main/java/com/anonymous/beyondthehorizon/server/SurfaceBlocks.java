@@ -39,6 +39,10 @@ final class SurfaceBlocks {
     /** A volume far outside the world, so the context samples the preliminary surface at single points, as vanilla's topMaterial does. */
     private static final DensityVolume NO_VOLUME = new DensityVolume(1, 1, 1, 1 << 29, 0, 1 << 29);
     private static final int S = BeyondTheHorizonConstants.TILE_SAMPLES;
+    /** From this sample spacing on the gradient of the ground is limited, see compute. */
+    private static final int COARSE_SPACING = 16;
+    /** One under the 4 blocks of height over 2 blocks at which vanilla's surface rules call the ground steep. */
+    private static final int MAX_COARSE_GRADIENT = 3;
 
     private final MaterialRuleContext context;
     private final MaterialRuleContextAccess access;
@@ -48,6 +52,8 @@ final class SurfaceBlocks {
     private final int seaLevel;
     /** The biome of the column being worked on, handed to the rules when they ask for it. */
     private @Nullable Holder<Biome> biome;
+    /** The blocks met so far, kept from tile to tile (cleared for each) instead of made anew. */
+    private final Object2IntOpenHashMap<Block> known = new Object2IntOpenHashMap<>();
 
     /** What a tile gets: the blocks named, and per sample 0 (unknown) or 1 plus the block's index. */
     record Result(List<Identifier> blocks, byte[] indices) {
@@ -67,6 +73,7 @@ final class SurfaceBlocks {
         );
         this.access = (MaterialRuleContextAccess) (Object) this.context;
         this.evaluator = (rule != null ? rule : full).compile(this.context);
+        this.known.defaultReturnValue(0);
     }
 
     static @Nullable SurfaceBlocks create(ServerLevel level, NoiseBasedChunkGenerator generator, RandomState randomState, int minY) {
@@ -82,8 +89,8 @@ final class SurfaceBlocks {
     ) {
         byte[] indices = new byte[BeyondTheHorizonConstants.TILE_SAMPLE_COUNT];
         List<Identifier> blocks = new ArrayList<>();
-        Object2IntOpenHashMap<Block> known = new Object2IntOpenHashMap<>();
-        known.defaultReturnValue(0);
+        Object2IntOpenHashMap<Block> known = this.known;
+        known.clear();
         for (int sz = 0; sz < S; sz++) {
             for (int sx = 0; sx < S; sx++) {
                 int index = sx + sz * S;
@@ -112,6 +119,12 @@ final class SurfaceBlocks {
                 // Vanilla's gradient is the height difference over two blocks; samples are further apart than that.
                 int gradientX = Math.round((east - west) * 2.0F / widthX);
                 int gradientZ = Math.round((south - north) * 2.0F / widthZ);
+                if (spacing >= COARSE_SPACING) {
+                    // Over 16 blocks or more a rolling hill rises by many blocks, which vanilla's steep rule (4 blocks over 2) would take
+                    // for a cliff and put bare stone on every slope; on such tiles the ground is never steeper than that.
+                    gradientX = Mth.clamp(gradientX, -MAX_COARSE_GRADIENT, MAX_COARSE_GRADIENT);
+                    gradientZ = Mth.clamp(gradientZ, -MAX_COARSE_GRADIENT, MAX_COARSE_GRADIENT);
+                }
                 int x = TileGenerator.clampToWorld(baseX + (long) sx * spacing);
                 int z = TileGenerator.clampToWorld(baseZ + (long) sz * spacing);
                 this.biome = palette.holders.get(biomes[index] & 0xFF);

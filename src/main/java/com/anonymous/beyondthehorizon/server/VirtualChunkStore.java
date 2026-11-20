@@ -1,6 +1,7 @@
 package com.anonymous.beyondthehorizon.server;
 
 import com.anonymous.beyondthehorizon.BeyondTheHorizonConstants;
+import com.anonymous.beyondthehorizon.WorkThrottle;
 import com.anonymous.beyondthehorizon.server.virtual.VirtualTerrain;
 import com.anonymous.beyondthehorizon.tile.BlockLook;
 import com.anonymous.beyondthehorizon.tile.Zip;
@@ -193,6 +194,30 @@ final class VirtualChunkStore {
         return region != null && scannedWith(region, scan) && region[index(chunk)] != null;
     }
 
+    /** Most virtual chunks one detailed tile task makes in one go; what is left stays missing and is made by a later request. */
+    static final int MAX_CHUNKS_PER_TASK = 2048;
+
+    /** What one task may still make, and whether it is no use any more (its player left, or the server stops). */
+    private static final class Budget {
+        int remaining = MAX_CHUNKS_PER_TASK;
+        final java.util.function.BooleanSupplier stale;
+
+        Budget(java.util.function.BooleanSupplier stale) {
+            this.stale = stale;
+        }
+    }
+
+    private static final ThreadLocal<Budget> BUDGET = new ThreadLocal<>();
+
+    /** Limits the virtual chunks made on this thread until {@link #endTask}; generation stops early once {@code stale} says so. */
+    static void beginTask(java.util.function.BooleanSupplier stale) {
+        BUDGET.set(new Budget(stale));
+    }
+
+    static void endTask() {
+        BUDGET.remove();
+    }
+
     private static int index(long chunk) {
         return Math.floorMod(ChunkPos.getX(chunk), REGION) + Math.floorMod(ChunkPos.getZ(chunk), REGION) * REGION;
     }
@@ -236,7 +261,19 @@ final class VirtualChunkStore {
                 maxX = minX + REGION - 1;
                 maxZ = minZ + REGION - 1;
             }
+            Budget budget = BUDGET.get();
+            if (minX <= maxX && budget != null) {
+                int wantedChunks = (maxX - minX + 1) * (maxZ - minZ + 1);
+                if (budget.stale.getAsBoolean() || budget.remaining < wantedChunks) {
+                    // Nothing more is made for this task: what is missing stays missing, and the tile is not final.
+                    minX = Integer.MAX_VALUE;
+                    maxX = Integer.MIN_VALUE;
+                } else {
+                    budget.remaining -= wantedChunks;
+                }
+            }
             if (minX <= maxX) {
+                WorkThrottle.yieldToFrames();
                 waitForServer(level);
                 long start = ServerPerf.ON ? System.nanoTime() : 0L;
                 ProtoChunk[] made;

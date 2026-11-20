@@ -10,7 +10,7 @@ import java.util.concurrent.atomic.AtomicLongArray;
 public final class PerfStats {
     /** The parts whose time is taken. */
     public enum Timer {
-        /** The terrain pass of a frame, with the trees, the structures and the water. */
+        /** The terrain pass of a frame, with the trees and the water. */
         TERRAIN,
         /** The pass that draws the ground a second time for the depth only. */
         DEPTH,
@@ -46,8 +46,6 @@ public final class PerfStats {
     public static volatile int groundDraws;
     public static volatile int treeMeshes;
     public static volatile long treeVertices;
-    public static volatile int structureMeshes;
-    public static volatile long structureVertices;
 
     private PerfStats() {
     }

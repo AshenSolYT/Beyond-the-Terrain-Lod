@@ -30,7 +30,7 @@ final class EndTileGenerator {
      * land where a good part of it is, so small islands still show up without joining into big plates.
      */
     private static final int FILTER_LEVEL = 8;
-    private static final int ENOUGH_LAND = 3;
+    private static final int ENOUGH_LAND = 1;
     /**
      * From this level on (8+ blocks between samples) the top of an island is worked out from the island shape and two samples of
      * the 3D noise, see {@link FloatingSurface#estimate}: a few blocks off at most. Finer rough tiles are rarely drawn at all, the
@@ -47,7 +47,7 @@ final class EndTileGenerator {
         int spacing = 1 << pos.level();
         boolean filtered = pos.level() >= FILTER_LEVEL;
         boolean estimate = pos.level() >= ESTIMATE_LEVEL;
-        int subStep = spacing / 3;
+        int subStep = spacing / 4;
         int margin = filtered ? subStep : 0;
         IslandShape shape = new IslandShape(level.getSeed(), pos.minX() - margin, pos.minZ() - margin,
             pos.minX() + (long) BeyondTheHorizonConstants.TILE_CELLS * spacing + margin, pos.minZ() + (long) BeyondTheHorizonConstants.TILE_CELLS * spacing + margin);
@@ -69,8 +69,8 @@ final class EndTileGenerator {
                     int land = 0;
                     int sum = 0;
                     for (int i = 0; i < TileData.SUB_SAMPLES; i++) {
-                        int x = TileGenerator.clampToWorld((long) blockX + (long) (i % 3 - 1) * subStep);
-                        int z = TileGenerator.clampToWorld((long) blockZ + (long) (i / 3 - 1) * subStep);
+                        int x = TileGenerator.clampToWorld((long) blockX + (long) ((i & 1) * 2 - 1) * subStep);
+                        int z = TileGenerator.clampToWorld((long) blockZ + (long) ((i >> 1) * 2 - 1) * subStep);
                         float islands = shape.density(x, z);
                         int subTop = estimate ? surface.estimate(x, z, islands) : surface.top(x, z, islands);
                         if (subTop != FloatingSurface.NONE) {

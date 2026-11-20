@@ -119,10 +119,14 @@ abstract class FogRendererMixin {
         fog.renderDistanceStart = start;
         fog.renderDistanceEnd = end;
         // The far fog of the atmosphere and the End's own fog (which would turn the islands into flat fog color long before the LOD
-        // distance) give way to this mod's: they are always measured round, and would hide its shape. Rain fog, closer, stays.
+        // distance) give way to this mod's. Vanilla measures the environmental fog round and the render-distance fog cylindrical, and
+        // the LOD shaders are round, so this mod's fog goes into the environmental one: vanilla's terrain then fades with the same
+        // sphere as the LOD terrain. Rain fog, closer, stays (and then the render-distance fog is kept).
         if (fog.environmentalEnd >= vanillaRange || DimensionKind.of(level) == DimensionKind.END) {
-            fog.environmentalStart = NO_FOG;
-            fog.environmentalEnd = NO_FOG;
+            fog.environmentalStart = start;
+            fog.environmentalEnd = end;
+            fog.renderDistanceStart = NO_FOG;
+            fog.renderDistanceEnd = NO_FOG;
         }
         // The band of the sky over the horizon in the fog color (the sky's own, see AtmosphericFogEnvironmentMixin, with the sunset tint)
         // keeps the same angle whatever the render distance: vanilla's goes by it, and at a small one is wide.

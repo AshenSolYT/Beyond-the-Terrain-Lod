@@ -31,7 +31,29 @@ public final class WorkThrottle {
     /** 0: smooth frames first, 1: load as fast as possible; set by the client from the player's speed and the settings. */
     private static volatile float urgency;
 
+    /**
+     * Raised when the tile server stops. Work that runs on threads that are no {@link Worker} (the helper threads of virtual chunk
+     * generation) remembers the number it started under and ends once it changed, see {@link #checkGeneration}.
+     */
+    private static volatile int generation;
+
     private WorkThrottle() {
+    }
+
+    /** Called when a tile server closes: all work that started before ends at its next {@link #checkGeneration}. */
+    public static void stopAll() {
+        generation++;
+    }
+
+    public static int generation() {
+        return generation;
+    }
+
+    /** Ends the current work with {@link Cancelled} if the tile server stopped since {@code started}, or the thread was interrupted. */
+    public static void checkGeneration(int started) {
+        if (generation != started || Thread.currentThread().isInterrupted()) {
+            throw new Cancelled();
+        }
     }
 
     /** Called by the client when a frame was late. */

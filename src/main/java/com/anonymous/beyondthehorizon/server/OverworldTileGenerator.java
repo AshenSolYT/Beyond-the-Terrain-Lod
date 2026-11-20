@@ -49,11 +49,16 @@ final class OverworldTileGenerator {
     private static final int S = BeyondTheHorizonConstants.TILE_SAMPLES;
     /**
      * From this level on (32+ blocks between samples) one sample per cell would pick random islands and hills, which looks like
-     * noise from far away. Such cells are sampled on a 3x3 grid and the client averages the colors.
+     * noise from far away. Such cells are sampled on a 2x2 grid and the client averages the colors.
      */
     private static final int FILTER_LEVEL = 5;
     /** From this level on the generator's 2D surface estimate is used instead of an exact search, where it is close enough. */
     private static final int ESTIMATE_LEVEL = 5;
+    /**
+     * From this level on (4+ blocks between samples) the surface is searched in the terrain without caves, see State.far: the caves
+     * are most of the work of the final density, and a cave that breaks through the surface cannot be told apart at this spacing.
+     */
+    private static final int FAR_LEVEL = 2;
     /** Largest average difference between the estimate and the exact surface for the estimate to be trusted on a tile. */
     private static final int MAX_ESTIMATE_ERROR = 48;
     /**
@@ -85,7 +90,9 @@ final class OverworldTileGenerator {
     /** Largest difference between the estimate and the exact surface at any one probe for the estimate to be trusted on a tile. */
     private static final int MAX_PROBE_ERROR = 96;
 
-    static TileData generate(ServerLevel level, TilePos pos, ChunkGenerator generator, RandomState randomState, TileGenerator.BiomeLookup biomes) {
+    static TileData generate(
+        ServerLevel level, TilePos pos, ChunkGenerator generator, RandomState randomState, TileGenerator.BiomeLookup biomes, @Nullable TileData parent
+    ) {
         long cpu = ServerPerf.cpu();
         int minY = level.getMinY();
         int maxY = level.getMaxY();
@@ -107,11 +114,13 @@ final class OverworldTileGenerator {
         }
         boolean filtered = pos.level() >= FILTER_LEVEL;
         // Sub-samples sit on whole quarts, so their biomes come from the same grid as their heights.
-        int subStep = filtered ? Math.max(GRID_SPACING, (spacing / 3) & -GRID_SPACING) : 0;
+        int subStep = filtered ? Math.max(GRID_SPACING, (spacing / 4) & -GRID_SPACING) : 0;
         boolean gridded = spacing >= GRID_SPACING && insideWorld(baseX - subStep, baseZ - subStep, (S - 1L) * spacing + 2L * subStep);
         ClimateGrid climate = gridded ? state.climate : null;
         // Far tiles look for the surface in the terrain without caves, which is much cheaper to sample, see State.far.
         DensitySurface far = state.far;
+        // The search of the finer tiles: the final density with its caves, from FAR_LEVEL on the terrain without them.
+        DensitySurface search = pos.level() >= FAR_LEVEL ? far : fast;
         boolean estimateOnly = pos.level() >= ESTIMATE_LEVEL && fast.estimateMatches(baseX, baseZ, BeyondTheHorizonConstants.TILE_CELLS * spacing);
 
         if (filtered) {
@@ -122,7 +131,7 @@ final class OverworldTileGenerator {
             // Sum of how deep the water is at the water sub-samples of each cell, for the average.
             int[] depthSum = state.depthSum();
             // Where the estimate is close to the sea level, the exact surface is found at the middle of the cell: one exact search per
-            // cell instead of nine. The estimates of the sub-samples are corrected by the difference there, see subCorrection.
+            // cell instead of four. The estimates of the sub-samples are corrected by the difference there, see subCorrection.
             int[] correction = state.correction();
             boolean[] corrected = state.corrected();
             IcebergPillars pillars = state.pillars;
@@ -131,12 +140,21 @@ final class OverworldTileGenerator {
             int[] estimates = state.estimates;
             for (int i = 0; i < TileData.SUB_SAMPLES; i++) {
                 WorkThrottle.yieldToFrames();
-                long offsetX = (long) (i % 3 - 1) * subStep;
-                long offsetZ = (long) (i / 3 - 1) * subStep;
+                long offsetX = (long) ((i & 1) * 2 - 1) * subStep;
+                long offsetZ = (long) ((i >> 1) * 2 - 1) * subStep;
                 for (int index = 0; index < BeyondTheHorizonConstants.TILE_SAMPLE_COUNT; index++) {
                     int x = TileGenerator.clampToWorld(baseX + (long) (index % S) * spacing + offsetX);
                     int z = TileGenerator.clampToWorld(baseZ + (long) (index / S) * spacing + offsetZ);
                     estimates[i * BeyondTheHorizonConstants.TILE_SAMPLE_COUNT + index] = fast.estimate(x, z);
+                }
+            }
+            if (estimateOnly) {
+                // The cell's own sample, after the sub-samples: where the exact surface is looked for, see correctNearSea.
+                int middle = TileData.SUB_SAMPLES * BeyondTheHorizonConstants.TILE_SAMPLE_COUNT;
+                for (int index = 0; index < BeyondTheHorizonConstants.TILE_SAMPLE_COUNT; index++) {
+                    int x = TileGenerator.clampToWorld(baseX + (long) (index % S) * spacing);
+                    int z = TileGenerator.clampToWorld(baseZ + (long) (index / S) * spacing);
+                    estimates[middle + index] = fast.estimate(x, z);
                 }
             }
             if (estimateOnly) {
@@ -145,8 +163,8 @@ final class OverworldTileGenerator {
             // One sub-sample position of every cell at a time: each forms a regular grid of its own.
             for (int i = 0; i < TileData.SUB_SAMPLES; i++) {
                 WorkThrottle.yieldToFrames();
-                long offsetX = (long) (i % 3 - 1) * subStep;
-                long offsetZ = (long) (i / 3 - 1) * subStep;
+                long offsetX = (long) ((i & 1) * 2 - 1) * subStep;
+                long offsetZ = (long) ((i >> 1) * 2 - 1) * subStep;
                 if (climate != null) {
                     climate.sampleGrid(baseX + offsetX, baseZ + offsetZ, spacing);
                 }
@@ -193,7 +211,7 @@ final class OverworldTileGenerator {
                 flags[index] = (byte) ((mostlyWater ? TileData.FLAG_WATER : 0) | (icebergCells[index] ? TileData.FLAG_ICEBERG : 0));
                 int waterCount = Integer.bitCount(subWater[index] & 0xFFFF);
                 depths[index] = mostlyWater && waterCount > 0 ? depthByte(depthSum[index] / waterCount) : 0;
-                biomeIndices[index] = subBiomes[index * TileData.SUB_SAMPLES + 4];
+                biomeIndices[index] = subBiomes[index * TileData.SUB_SAMPLES + TileData.SUB_SAMPLES - 1];
             }
             if (ServerPerf.ON) {
                 (estimateOnly ? ServerPerf.ROUGH_ESTIMATED : ServerPerf.ROUGH_EXACT).add(ServerPerf.cpu() - cpu);
@@ -205,6 +223,11 @@ final class OverworldTileGenerator {
             climate.sampleGrid(baseX, baseZ, spacing);
         }
         boolean neighbourHint = spacing <= NEIGHBOUR_HINT_SPACING;
+        // Every other sample of this tile lies on a sample of the coarser tile around it, whose exact surface is taken over. A tile that
+        // is averaged over its cells (FILTER_LEVEL and up) has no exact surface to give.
+        TileData reuse = parent != null && pos.level() + 1 < FILTER_LEVEL && parent.subBiomes == null && parent.waterDepths != null ? parent : null;
+        int parentColumn = (pos.x() & 1) * ((S - 1) / 2);
+        int parentRow = (pos.z() & 1) * ((S - 1) / 2);
         // Vanilla's icebergs, where they are; coarse tiles leave them out, they would only be specks.
         // Each sample takes the highest iceberg of the cell around it, so the field reaches half a cell past the tile.
         int cellStart = -(spacing / 2);
@@ -227,13 +250,19 @@ final class OverworldTileGenerator {
                 int blockX = TileGenerator.clampToWorld(baseX + (long) sx * spacing);
                 int index = sx + sz * S;
                 int groundY;
-                if (estimateOnly) {
+                int taken = Integer.MIN_VALUE;
+                if (reuse != null && (sx & 1) == 0 && (sz & 1) == 0) {
+                    taken = takenGround(reuse, (parentColumn + (sx >> 1)) + (parentRow + (sz >> 1)) * S, fast.seaLevel);
+                }
+                if (taken != Integer.MIN_VALUE) {
+                    groundY = taken;
+                } else if (estimateOnly) {
                     int estimate = fast.estimate(blockX, blockZ);
-                    groundY = nearSea(estimate, fast.seaLevel) ? fast.surface(blockX, blockZ, estimate) : estimate;
+                    groundY = nearSea(estimate, fast.seaLevel) ? search.surface(blockX, blockZ, estimate) : estimate;
                 } else if (neighbourHint && previousGround != Integer.MIN_VALUE) {
-                    groundY = fast.surface(blockX, blockZ, previousGround);
+                    groundY = search.surface(blockX, blockZ, previousGround);
                 } else {
-                    groundY = fast.surface(blockX, blockZ, fast.estimate(blockX, blockZ));
+                    groundY = search.surface(blockX, blockZ, fast.estimate(blockX, blockZ));
                 }
                 previousGround = groundY;
                 if (sx == 0) {
@@ -268,6 +297,24 @@ final class OverworldTileGenerator {
             ServerPerf.ROUGH_NEAR.add(ServerPerf.cpu() - cpu);
         }
         return withSurface(state, palette, heights, biomeIndices, flags, depths, null, null, baseX, baseZ, spacing);
+    }
+
+    /**
+     * The height of the ground at a sample of a finished tile, for the same place in a finer tile; Integer.MIN_VALUE where it cannot be
+     * told (icebergs, or water deeper than the tile can say).
+     */
+    private static int takenGround(TileData tile, int index, int seaLevel) {
+        int flag = tile.flags[index];
+        if (flag == 0) {
+            return tile.heights[index];
+        }
+        if (flag == TileData.FLAG_WATER && tile.waterDepths != null) {
+            int depth = tile.waterDepths[index] & 0xFF;
+            if (depth > 0 && depth < 255) {
+                return seaLevel - depth;
+            }
+        }
+        return Integer.MIN_VALUE;
     }
 
     /** The tile with the blocks the surface rules put on its samples; without them when they cannot be worked out, the client then guesses. */
@@ -344,8 +391,8 @@ final class OverworldTileGenerator {
         DensitySurface fast, long baseX, long baseZ, int spacing, int[] estimates, int[] correction, boolean[] corrected
     ) {
         int count = BeyondTheHorizonConstants.TILE_SAMPLE_COUNT;
-        // The middle sub-sample is the cell's own sample.
-        int middle = 4 * count;
+        // The estimates of the cells' own samples come after those of the sub-samples.
+        int middle = TileData.SUB_SAMPLES * count;
         for (int index = 0; index < count; index++) {
             int sx = index % S;
             int sz = index / S;
@@ -405,7 +452,8 @@ final class OverworldTileGenerator {
         private final int[] correction = new int[BeyondTheHorizonConstants.TILE_SAMPLE_COUNT];
         private final boolean[] corrected = new boolean[BeyondTheHorizonConstants.TILE_SAMPLE_COUNT];
         private final boolean[] icebergCells = new boolean[BeyondTheHorizonConstants.TILE_SAMPLE_COUNT];
-        final int[] estimates = new int[BeyondTheHorizonConstants.TILE_SAMPLE_COUNT * TileData.SUB_SAMPLES];
+        /** The estimates of the sub-samples, then (when the estimates alone are used) those of the cells' own samples. */
+        final int[] estimates = new int[BeyondTheHorizonConstants.TILE_SAMPLE_COUNT * (TileData.SUB_SAMPLES + 1)];
 
         private State(ServerLevel level, ChunkGenerator generator, RandomState randomState, int minY, int maxY) {
             this.generator = generator;
@@ -471,13 +519,8 @@ final class OverworldTileGenerator {
             if (blocks == null) {
                 return null;
             }
-            long cpu = ServerPerf.cpu();
             try {
-                SurfaceBlocks.Result result = blocks.compute(palette, heights, biomes, flags, depths, baseX, baseZ, spacing);
-                if (ServerPerf.ON) {
-                    LOGGER.info("[FarPlane terrain] surface blocks of a tile: {} ms, {} kinds", (ServerPerf.cpu() - cpu) / 1_000_000.0, result.blocks().size());
-                }
-                return result;
+                return blocks.compute(palette, heights, biomes, flags, depths, baseX, baseZ, spacing);
             } catch (RuntimeException | LinkageError e) {
                 if (!this.surfaceFailed) {
                     this.surfaceFailed = true;
@@ -577,7 +620,7 @@ final class OverworldTileGenerator {
 
     /**
      * The correction of the estimate at sub-sample {@code i} of a cell: blended from the corrections at the middle of the cells it lies
-     * between, by how far it lies towards them (a third of a cell), as the error of the estimate changes over a cell on rugged
+     * between, by how far it lies towards them (a quarter of a cell), as the error of the estimate changes over a cell on rugged
      * ground. Cells without a correction count with the cell's own. Samples on tile edges keep their own correction, see generate.
      */
     private static int subCorrection(int[] correction, boolean[] corrected, int index, int i) {
@@ -587,10 +630,10 @@ final class OverworldTileGenerator {
         if (isEdge(sx, sz)) {
             return own;
         }
-        int dx = i % 3 - 1;
-        int dz = i / 3 - 1;
-        float wx = Math.abs(dx) / 3.0F;
-        float wz = Math.abs(dz) / 3.0F;
+        int dx = (i & 1) * 2 - 1;
+        int dz = (i >> 1) * 2 - 1;
+        float wx = 0.25F;
+        float wz = 0.25F;
         int across = index + dx;
         int down = index + dz * S;
         int diagonal = index + dx + dz * S;
@@ -610,6 +653,9 @@ final class OverworldTileGenerator {
         int maxY = level.getMaxY();
         int spacing = 1 << pos.level();
         for (int index = 0; index < BeyondTheHorizonConstants.TILE_SAMPLE_COUNT; index++) {
+            if (index % S == 0) {
+                WorkThrottle.yieldToFrames();
+            }
             int blockX = TileGenerator.clampToWorld(pos.minX() + (long) (index % S) * spacing);
             int blockZ = TileGenerator.clampToWorld(pos.minZ() + (long) (index / S) * spacing);
             NoiseColumn column = generator.getBaseColumn(blockX, blockZ, level, randomState);

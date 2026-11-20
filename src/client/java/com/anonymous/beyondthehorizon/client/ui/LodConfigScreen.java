@@ -88,7 +88,6 @@ public class LodConfigScreen extends OptionsSubScreen {
         this.list.addBig(slider("tree_level", 0, 4, c.treeLevel, v -> v == 0 ? Component.translatable(PREFIX + "off") : Component.literal((1 << v) + " " + Component.translatable(PREFIX + "blocks").getString()), v -> c.treeLevel = v));
         this.list.addBig(slider("tree_density", 10, 200, c.treeDensity, v -> Component.literal(v + " %"), v -> c.treeDensity = v));
         this.list.addBig(slider("tree_billboard", 0, 5, c.treeBillboardLevel, v -> v == 5 ? Component.translatable(PREFIX + "off") : Component.literal((1 << v) + " " + Component.translatable(PREFIX + "blocks").getString()), v -> c.treeBillboardLevel = v));
-        this.list.addBig(slider("structure_range", 0, 32, c.structureRange, v -> v == 0 ? Component.translatable(PREFIX + "off") : Component.literal((v * 256) + " " + Component.translatable(PREFIX + "blocks").getString()), v -> c.structureRange = v));
         this.list.addBig(Button.builder(Component.translatable(PREFIX + "clear_cache"), button -> {
             BeyondTheHorizonClient.manager().reloadAll();
             button.setMessage(Component.translatable(PREFIX + "clear_cache.done"));

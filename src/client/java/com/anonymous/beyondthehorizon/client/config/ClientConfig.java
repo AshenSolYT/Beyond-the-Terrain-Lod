@@ -49,8 +49,6 @@ public final class ClientConfig {
     public int treeBillboardLevel = 2;
     /** Tiles with a sample spacing up to 2 to this power in blocks are drawn as stepped columns (flat tops, walls between them) instead of the smooth ground; 0 is one block per column, -1 is off. */
     public int stepLevel = 3;
-    /** How far the distant structures (villages and the like, as rough boxes) are drawn, in steps of 256 blocks; 0 is off. */
-    public int structureRange = 8;
 
     public int distanceBlocks() {
         return this.distanceChunks * 16;
@@ -95,7 +93,6 @@ public final class ClientConfig {
                 config.treeDensity = number(p, "treeDensity", config.treeDensity);
                 config.treeBillboardLevel = number(p, "treeBillboardLevel", config.treeBillboardLevel);
                 config.stepLevel = number(p, "stepSpacing", config.stepLevel);
-                config.structureRange = number(p, "structureRange", config.structureRange);
             } catch (IOException | RuntimeException e) {
                 LOGGER.warn("Could not read {}, using defaults", path, e);
             }
@@ -124,7 +121,6 @@ public final class ClientConfig {
         this.treeDensity = Mth.clamp(this.treeDensity, 10, 200);
         this.treeBillboardLevel = Mth.clamp(this.treeBillboardLevel, 0, 5);
         this.stepLevel = Mth.clamp(this.stepLevel, -1, 4);
-        this.structureRange = Mth.clamp(this.structureRange, 0, 32);
     }
 
     public void save() {
@@ -142,7 +138,6 @@ public final class ClientConfig {
         p.setProperty("treeDensity", Integer.toString(this.treeDensity));
         p.setProperty("treeBillboardLevel", Integer.toString(this.treeBillboardLevel));
         p.setProperty("stepSpacing", Integer.toString(this.stepLevel));
-        p.setProperty("structureRange", Integer.toString(this.structureRange));
         try (Writer out = Files.newBufferedWriter(path())) {
             p.store(out, "Beyond the Terrain client settings");
         } catch (IOException e) {

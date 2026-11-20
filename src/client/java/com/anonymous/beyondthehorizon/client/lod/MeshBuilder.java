@@ -2,6 +2,7 @@ package com.anonymous.beyondthehorizon.client.lod;
 
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.util.Arrays;
 import org.jspecify.annotations.Nullable;
 
 /**
@@ -42,7 +43,9 @@ public final class MeshBuilder {
     public record Mesh(
         ByteBuffer data, int groundIndexCount, int ownGroundIndexOffset, int waterVertexOffset, int waterIndexOffset, int waterIndexCount,
         float minY, float maxY, int treeVertexOffset, int treeVertexCount, int treeIndexOffset, int treeIndexCount,
-        int stepVertexOffset, int stepVertexCount, int stepIndexOffset, int stepIndexCount
+        int stepVertexOffset, int stepVertexCount, int stepIndexOffset, int stepIndexCount, float waterLevel,
+        /** The lowest point of the ground itself (and of the water over it), without the skirt that hangs below the edges of the tile. */
+        float surfaceMinY
     ) {
         public boolean sharedIndices() {
             return this.ownGroundIndexOffset < 0;
@@ -173,7 +176,9 @@ public final class MeshBuilder {
             waterIndexOffset, waterCount, Math.min(minY, in.waterLevel() < minY && waterCount > 0 ? in.waterLevel() : minY) - skirt,
             Math.max(Math.max(maxY, trees == null ? maxY : trees.maxY()), waterCount > 0 ? in.waterLevel() : maxY),
             treeVertices > 0 ? treeVertexOffset : -1, treeVertices, treeIndices > 0 ? treeVertexOffset + treeVertices * VERTEX_SIZE : -1, treeIndices,
-            stepVertices > 0 ? stepVertexOffset : -1, stepVertices, stepIndices > 0 ? stepVertexOffset + stepVertices * VERTEX_SIZE : -1, stepIndices
+            stepVertices > 0 ? stepVertexOffset : -1, stepVertices, stepIndices > 0 ? stepVertexOffset + stepVertices * VERTEX_SIZE : -1, stepIndices, in.waterLevel(),
+            // The columns are rounded down to a block, so a stepped tile can lie a block under its lowest sample.
+            Math.min(minY, in.waterLevel() < minY && waterCount > 0 ? in.waterLevel() : minY) - (steps != null ? 1.0F : 0.0F)
         );
     }
 
@@ -222,8 +227,8 @@ public final class MeshBuilder {
     }
 
     /** How dark the walls of a column are against its top, by the side they face. */
-    private static final float WALL_EAST_WEST = 0.78F;
-    private static final float WALL_NORTH_SOUTH = 0.64F;
+    private static final float WALL_EAST_WEST = 0.70F;
+    private static final float WALL_NORTH_SOUTH = 0.54F;
 
     /**
      * The ground as columns: a cell is a flat top at the height of its corners' mean, rounded down to a block, with a wall wherever
@@ -231,10 +236,15 @@ public final class MeshBuilder {
      */
     private static Steps steps(Input in) {
         int spacing = in.spacing();
-        float skirt = Math.max(spacing * 3.0F, 8.0F);
-        float[] tops = new float[CELLS * CELLS];
-        int[] cellColors = new int[CELLS * CELLS];
-        boolean[] has = new boolean[CELLS * CELLS];
+        // The neighbour tile is not known: a short skirt leaves a see-through gap along a cliff where it is much lower.
+        float skirt = Math.max(spacing * 3.0F, 48.0F);
+        StepScratch scratch = STEP_SCRATCH.get();
+        float[] tops = scratch.tops;
+        int[] cellColors = scratch.colors;
+        boolean[] has = scratch.has;
+        boolean[] used = scratch.used;
+        Arrays.fill(has, false);
+        Arrays.fill(used, false);
         for (int z = 0; z < CELLS; z++) {
             for (int x = 0; x < CELLS; x++) {
                 int a = x + z * SAMPLES;
@@ -244,8 +254,15 @@ public final class MeshBuilder {
                     continue;
                 }
                 float[] g = in.ground();
-                tops[cell] = (float) Math.floor((g[a] + g[a + 1] + g[a + SAMPLES] + g[a + SAMPLES + 1]) / 4.0F);
                 int[] c = in.colors();
+                if (spacing == 1) {
+                    // One block per cell: the sample is the column itself, its neighbours' mean would blur the steps.
+                    tops[cell] = (float) Math.floor(g[a]);
+                    cellColors[cell] = 0xFF000000 | c[a] & 0xFFFFFF;
+                    has[cell] = true;
+                    continue;
+                }
+                tops[cell] = (float) Math.floor((g[a] + g[a + 1] + g[a + SAMPLES] + g[a + SAMPLES + 1]) / 4.0F);
                 int r = ((c[a] >>> 16 & 255) + (c[a + 1] >>> 16 & 255) + (c[a + SAMPLES] >>> 16 & 255) + (c[a + SAMPLES + 1] >>> 16 & 255)) / 4;
                 int gr = ((c[a] >>> 8 & 255) + (c[a + 1] >>> 8 & 255) + (c[a + SAMPLES] >>> 8 & 255) + (c[a + SAMPLES + 1] >>> 8 & 255)) / 4;
                 int b = ((c[a] & 255) + (c[a + 1] & 255) + (c[a + SAMPLES] & 255) + (c[a + SAMPLES + 1] & 255)) / 4;
@@ -258,39 +275,77 @@ public final class MeshBuilder {
             int x = 0;
             while (x < CELLS) {
                 int cell = x + z * CELLS;
-                if (!has[cell]) {
+                if (!has[cell] || used[cell]) {
                     x++;
                     continue;
                 }
                 float h = tops[cell];
                 int color = cellColors[cell];
-                // A run of cells of one height and about one color is one top: far fewer vertices over flat ground.
+                // A rectangle of cells of one height and about one color is one top: far fewer vertices over flat and rolling ground.
+                // First the run along the row, then the rows below it that have the same run.
                 int end = x;
-                while (end + 1 < CELLS && has[cell + end + 1 - x] && tops[cell + end + 1 - x] == h && close(cellColors[cell + end + 1 - x], color)) {
+                while (end + 1 < CELLS && joins(has, used, tops, cellColors, cell + end + 1 - x, h, color)) {
                     end++;
+                }
+                int zEnd = z;
+                while (zEnd + 1 < CELLS) {
+                    boolean whole = true;
+                    for (int cx = x; cx <= end; cx++) {
+                        if (!joins(has, used, tops, cellColors, cx + (zEnd + 1) * CELLS, h, color)) {
+                            whole = false;
+                            break;
+                        }
+                    }
+                    if (!whole) {
+                        break;
+                    }
+                    zEnd++;
+                }
+                for (int rz = z; rz <= zEnd; rz++) {
+                    for (int cx = x; cx <= end; cx++) {
+                        used[cx + rz * CELLS] = true;
+                    }
                 }
                 float x0 = x * spacing;
                 float x1 = (end + 1) * spacing;
                 float z0 = z * spacing;
-                float z1 = z0 + spacing;
+                float z1 = (zEnd + 1) * spacing;
                 // Every face is wound counter-clockwise seen from outside, like the ground grid (up for tops).
                 out.quad(x0, h, z0, x0, h, z1, x1, h, z1, x1, h, z0, color);
-                int last = cell + end - x;
-                float east = end + 1 < CELLS ? (has[last + 1] ? tops[last + 1] : h) : h - skirt;
-                float west = x > 0 ? (has[cell - 1] ? tops[cell - 1] : h) : h - skirt;
-                if (east < h) {
-                    out.quad(x1, east, z1, x1, east, z0, x1, h, z0, x1, h, z1, scale(color, WALL_EAST_WEST));
+                // The walls at the east and west sides: the neighbours differ from row to row, and rows whose neighbour is as low as the
+                // one before share a wall.
+                int eastColor = scale(color, WALL_EAST_WEST);
+                int rz = z;
+                while (rz <= zEnd) {
+                    float east = eastHeight(tops, has, end, rz, h, skirt);
+                    int last = rz;
+                    while (last + 1 <= zEnd && eastHeight(tops, has, end, last + 1, h, skirt) == east) {
+                        last++;
+                    }
+                    if (east < h) {
+                        out.quad(x1, east, (last + 1) * spacing, x1, east, rz * spacing, x1, h, rz * spacing, x1, h, (last + 1) * spacing, eastColor);
+                    }
+                    rz = last + 1;
                 }
-                if (west < h) {
-                    out.quad(x0, west, z0, x0, west, z1, x0, h, z1, x0, h, z0, scale(color, WALL_EAST_WEST));
+                rz = z;
+                while (rz <= zEnd) {
+                    float west = westHeight(tops, has, x, rz, h, skirt);
+                    int last = rz;
+                    while (last + 1 <= zEnd && westHeight(tops, has, x, last + 1, h, skirt) == west) {
+                        last++;
+                    }
+                    if (west < h) {
+                        out.quad(x0, west, rz * spacing, x0, west, (last + 1) * spacing, x0, h, (last + 1) * spacing, x0, h, rz * spacing, eastColor);
+                    }
+                    rz = last + 1;
                 }
-                // The walls along the run: the neighbours on those sides differ from cell to cell, and cells whose neighbour is as low
-                // as the one before share a wall.
+                // The walls along the rectangle's far and near sides: the neighbours on those sides differ from cell to cell, and cells whose
+                // neighbour is as low as the one before share a wall.
                 int cx = x;
                 while (cx <= end) {
-                    float south = southHeight(tops, has, z, cx, h, skirt);
+                    float south = southHeight(tops, has, zEnd, cx, h, skirt);
                     int last2 = cx;
-                    while (last2 + 1 <= end && southHeight(tops, has, z, last2 + 1, h, skirt) == south) {
+                    while (last2 + 1 <= end && southHeight(tops, has, zEnd, last2 + 1, h, skirt) == south) {
                         last2++;
                     }
                     if (south < h) {
@@ -319,6 +374,33 @@ public final class MeshBuilder {
         }
         return out;
     }
+
+    /** Whether a cell joins a rectangle of cells of height {@code h} and about the color {@code color}. */
+    private static boolean joins(boolean[] has, boolean[] used, float[] tops, int[] cellColors, int c, float h, int color) {
+        return has[c] && !used[c] && tops[c] == h && close(cellColors[c], color);
+    }
+
+    /** The height east of the rectangle's last column {@code lastX}, in row {@code z}. */
+    private static float eastHeight(float[] tops, boolean[] has, int lastX, int z, float h, float skirt) {
+        int c = lastX + z * CELLS;
+        return lastX + 1 < CELLS ? (has[c + 1] ? tops[c + 1] : h) : h - skirt;
+    }
+
+    /** The height west of the rectangle's first column {@code firstX}, in row {@code z}. */
+    private static float westHeight(float[] tops, boolean[] has, int firstX, int z, float h, float skirt) {
+        int c = firstX + z * CELLS;
+        return firstX > 0 ? (has[c - 1] ? tops[c - 1] : h) : h - skirt;
+    }
+
+    /** The arrays {@link #steps} works in, one set per thread: they are cleared where it matters when it starts. */
+    private static final class StepScratch {
+        final float[] tops = new float[CELLS * CELLS];
+        final int[] colors = new int[CELLS * CELLS];
+        final boolean[] has = new boolean[CELLS * CELLS];
+        final boolean[] used = new boolean[CELLS * CELLS];
+    }
+
+    private static final ThreadLocal<StepScratch> STEP_SCRATCH = ThreadLocal.withInitial(StepScratch::new);
 
     private static float southHeight(float[] tops, boolean[] has, int z, int cx, float h, float skirt) {
         int c = cx + z * CELLS;

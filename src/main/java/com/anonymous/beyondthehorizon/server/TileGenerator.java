@@ -37,13 +37,21 @@ public final class TileGenerator {
     }
 
     public static TileData generate(ServerLevel level, TilePos pos) {
+        return generate(level, pos, null);
+    }
+
+    /**
+     * {@code parent} is the finished tile one level coarser that covers this one, if it is at hand: a fine tile shares every other sample
+     * position with it, and what was found there is not searched for again.
+     */
+    public static TileData generate(ServerLevel level, TilePos pos, @Nullable TileData parent) {
         ChunkGenerator generator = level.getChunkSource().getGenerator();
         RandomState randomState = level.getChunkSource().randomState();
         BiomeLookup biomes = new BiomeLookup(generator.getBiomeSource().createUncachedResolver(randomState), pos.level() < 2);
         if (DimensionKind.of(level) == DimensionKind.END && generator instanceof NoiseBasedChunkGenerator noise) {
             return EndTileGenerator.generate(level, noise, randomState, biomes, pos);
         }
-        return OverworldTileGenerator.generate(level, pos, generator, randomState, biomes);
+        return OverworldTileGenerator.generate(level, pos, generator, randomState, biomes, parent);
     }
 
     /**

@@ -396,6 +396,21 @@ final class DetailGenerator {
         int top;
     }
 
+    /** The chunks of the world as summaries (loaded ones live, saved ones read through the shared cache), for tiles that follow the real world. */
+    static final class RealChunks implements RealSurface.Chunks {
+        private final Context context;
+
+        RealChunks(ServerLevel level, Long2ObjectMap<LevelChunk> loaded, ChunkSummaryCache saved, ChunkSummary.Scan scan) {
+            // The tile position only sets the cell size of the detailed tiles, which is not used here.
+            this.context = new Context(level, new TilePos(1, 0, 0), loaded, saved, null, scan);
+        }
+
+        @Override
+        public @Nullable ChunkSummary summary(int chunkX, int chunkZ) {
+            return this.context.summary(chunkX, chunkZ);
+        }
+    }
+
     private static final class Context {
         private final ServerLevel level;
         private final Identifier dimension;

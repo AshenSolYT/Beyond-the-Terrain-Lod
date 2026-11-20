@@ -46,7 +46,6 @@ public final class BeyondTheHorizonClient implements ClientModInitializer {
 
         ClientPlayNetworking.registerGlobalReceiver(BeyondTheHorizonPayloads.Hello.TYPE, (payload, context) -> manager.onHello(payload));
         ClientPlayNetworking.registerGlobalReceiver(BeyondTheHorizonPayloads.TileDataPayload.TYPE, (payload, context) -> manager.onTileData(payload));
-        ClientPlayNetworking.registerGlobalReceiver(BeyondTheHorizonPayloads.StructureDataPayload.TYPE, (payload, context) -> manager.onStructureData(payload));
         ClientPlayNetworking.registerGlobalReceiver(BeyondTheHorizonPayloads.CacheCleared.TYPE, (payload, context) -> manager.onCacheCleared(payload));
         ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> manager.onDisconnect());
 

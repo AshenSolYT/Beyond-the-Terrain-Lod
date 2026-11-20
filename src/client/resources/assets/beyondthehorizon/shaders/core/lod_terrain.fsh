@@ -6,7 +6,6 @@
 #include <minecraft:dynamictransforms.glsl>
 
 layout(location = 0) in float sphericalVertexDistance;
-layout(location = 1) in float cylindricalVertexDistance;
 layout(location = 2) in vec4 vertexColor;
 #ifdef PIXEL_COLOR
 layout(location = 3) in vec2 localXZ;
@@ -48,11 +47,11 @@ void main() {
     fragColor = vec4(0.0);
     return;
 #endif
-    // The last value of the fog buffer tells the shape of the fog: round or cylindrical, see LodFog.
-    float renderDistance = FogCloudsEnd > 0.5 ? sphericalVertexDistance : cylindricalVertexDistance;
+    // The fog is always radial: the render-distance fog is measured like the environmental one, by the 3D distance.
+    float renderDistance = sphericalVertexDistance;
     vec4 smoothColor = vertexColor;
 #ifdef SPRITES
-    // ColorModulator.x: the distance of vanilla chunks around the camera for trees and structures, inside it they are the real ones; 0 elsewhere.
+    // ColorModulator.x: the distance of vanilla chunks around the camera for trees, inside it they are the real ones; 0 elsewhere.
     if (ColorModulator.x > 0.5 && dot(relativeXZ, relativeXZ) < ColorModulator.x * ColorModulator.x) {
         discard;
     }

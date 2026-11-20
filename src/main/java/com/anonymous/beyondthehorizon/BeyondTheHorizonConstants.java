@@ -22,7 +22,7 @@ public final class BeyondTheHorizonConstants {
         return current;
     }
 
-    public static final int PROTOCOL_VERSION = 20;
+    public static final int PROTOCOL_VERSION = 22;
 
     /** Cells along one tile edge. A tile holds TILE_CELLS + 1 samples per edge so neighbours share border samples. */
     public static final int TILE_CELLS = 32;

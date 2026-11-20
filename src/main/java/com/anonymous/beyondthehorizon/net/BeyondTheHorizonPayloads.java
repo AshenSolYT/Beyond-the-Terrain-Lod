@@ -2,7 +2,6 @@ package com.anonymous.beyondthehorizon.net;
 
 import com.anonymous.beyondthehorizon.BeyondTheHorizonConstants;
 import com.anonymous.beyondthehorizon.tile.DetailData;
-import com.anonymous.beyondthehorizon.tile.StructureData;
 import com.anonymous.beyondthehorizon.tile.TileData;
 import io.netty.handler.codec.DecoderException;
 import net.fabricmc.fabric.api.networking.v1.PayloadTypeRegistry;
@@ -186,59 +185,6 @@ public final class BeyondTheHorizonPayloads {
         }
     }
 
-    /**
-     * Regions of the distant structure layer to make, see {@link StructureData}: pairs of region x and z. The layer has its own request
-     * and answer, apart from the terrain tiles.
-     */
-    public record StructureRequest(int[] regions) implements CustomPacketPayload {
-        public static final Type<StructureRequest> TYPE = new Type<>(id("structure_request"));
-        public static final StreamCodec<FriendlyByteBuf, StructureRequest> CODEC = CustomPacketPayload.codec(StructureRequest::write, StructureRequest::read);
-
-        private void write(FriendlyByteBuf buf) {
-            int count = Math.min(this.regions.length / 2, StructureData.MAX_REGIONS);
-            buf.writeVarInt(count);
-            for (int i = 0; i < count * 2; i++) {
-                buf.writeVarInt(this.regions[i]);
-            }
-        }
-
-        private static StructureRequest read(FriendlyByteBuf buf) {
-            int count = buf.readVarInt();
-            if (count < 0 || count > StructureData.MAX_REGIONS) {
-                throw new DecoderException("Too many structure regions: " + count);
-            }
-            int[] regions = new int[count * 2];
-            for (int i = 0; i < regions.length; i++) {
-                regions[i] = buf.readVarInt();
-            }
-            return new StructureRequest(regions);
-        }
-
-        @Override
-        public Type<StructureRequest> type() {
-            return TYPE;
-        }
-    }
-
-    /** The answer to a {@link StructureRequest}: the compressed {@link StructureData#encode()} blob, with every requested region in it. */
-    public record StructureDataPayload(Identifier dimension, byte[] data) implements CustomPacketPayload {
-        public static final Type<StructureDataPayload> TYPE = new Type<>(id("structure_data"));
-        public static final StreamCodec<FriendlyByteBuf, StructureDataPayload> CODEC = CustomPacketPayload.codec(StructureDataPayload::write, StructureDataPayload::read);
-
-        private void write(FriendlyByteBuf buf) {
-            buf.writeIdentifier(this.dimension);
-            buf.writeByteArray(this.data);
-        }
-
-        private static StructureDataPayload read(FriendlyByteBuf buf) {
-            return new StructureDataPayload(buf.readIdentifier(), buf.readByteArray(StructureData.MAX_COMPRESSED_SIZE));
-        }
-
-        @Override
-        public Type<StructureDataPayload> type() {
-            return TYPE;
-        }
-    }
 
     /**
      * Client asks the server to forget every cached tile. Only the singleplayer host and server admins are allowed to do that.
@@ -311,8 +257,6 @@ public final class BeyondTheHorizonPayloads {
         PayloadTypeRegistry.clientboundPlay().register(CacheCleared.TYPE, CacheCleared.CODEC);
         PayloadTypeRegistry.clientboundPlay().register(DetailDataPayload.TYPE, DetailDataPayload.CODEC);
         PayloadTypeRegistry.clientboundPlay().register(DetailDirty.TYPE, DetailDirty.CODEC);
-        PayloadTypeRegistry.clientboundPlay().register(StructureDataPayload.TYPE, StructureDataPayload.CODEC);
-        PayloadTypeRegistry.serverboundPlay().register(StructureRequest.TYPE, StructureRequest.CODEC);
         PayloadTypeRegistry.serverboundPlay().register(DetailRequest.TYPE, DetailRequest.CODEC);
         PayloadTypeRegistry.serverboundPlay().register(TileRequest.TYPE, TileRequest.CODEC);
         PayloadTypeRegistry.serverboundPlay().register(ClearCache.TYPE, ClearCache.CODEC);

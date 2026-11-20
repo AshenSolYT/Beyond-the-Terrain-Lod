@@ -398,8 +398,10 @@ public final class VirtualTerrain {
      * done. A failure on any thread is thrown here, and the rest of the work is dropped.
      */
     private static void parallel(int count, java.util.function.IntConsumer task) {
+        int started = WorkThrottle.generation();
         if (HELPER_POOL == null || count <= 1) {
             for (int i = 0; i < count; i++) {
+                WorkThrottle.checkGeneration(started);
                 task.accept(i);
             }
             return;
@@ -407,6 +409,7 @@ public final class VirtualTerrain {
         java.util.concurrent.atomic.AtomicInteger next = new java.util.concurrent.atomic.AtomicInteger();
         Runnable work = () -> {
             for (int i = next.getAndIncrement(); i < count; i = next.getAndIncrement()) {
+                WorkThrottle.checkGeneration(started);
                 task.accept(i);
             }
         };
@@ -593,7 +596,7 @@ public final class VirtualTerrain {
 
     /**
      * The valid structure starts whose start chunk lies in a rectangle of chunks, worked out like vanilla does and without touching the
-     * world. Used by the distant structure layer, which is apart from the terrain.
+     * world.
      */
     public List<StructureStart> startsIn(int minChunkX, int minChunkZ, int sizeX, int sizeZ) {
         List<StructureStart> out = new ArrayList<>();

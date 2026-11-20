@@ -102,25 +102,17 @@ public class ServerConfigScreen extends OptionsSubScreen {
             v -> v == 0 ? Component.translatable(PREFIX + "whole_world") : Component.literal(number(v * 1000) + " " + blocks),
             v -> c.maxDistance = v == 0 ? BeyondTheHorizonConstants.MAX_LOD_DISTANCE : v * 1000));
         this.list.addBig(toggle("enabled", c.enabled, v -> c.enabled = v));
+        // Structures and player-made builds in the terrain, with a quality apart from the terrain's.
+        this.list.addBig(toggle("builds", c.builds, v -> c.builds = v));
+        this.list.addBig(slider("builds_level", 0, 2, Mth.clamp(c.buildsLevel, 0, 2), v -> Component.literal((32 << v) + " " + blocks), v -> c.buildsLevel = v));
 
         // Generating ahead of time by /farplane pregen distant.
         this.list.addBig(slider("pregen_threads", 0, 16, c.pregenThreads, ServerConfigScreen::auto, v -> c.pregenThreads = v));
-        // The distant structures, a layer apart from the terrain; in steps of 256 blocks.
-        this.list.addBig(toggle("structures", c.structuresEnabled, v -> c.structuresEnabled = v));
-        this.list.addBig(slider("structure_distance", 2, 64, Mth.clamp(c.structureDistance / 256, 2, 64), v -> Component.literal(number(v * 256) + " " + blocks), v -> c.structureDistance = v * 256));
 
         // The caches.
         this.list.addBig(toggle("disk_cache", c.diskCache, v -> c.diskCache = v));
         // In steps of 256 tiles.
         this.list.addBig(slider("memory_cache", 0, 256, c.memoryCacheTiles / 256, v -> Component.literal(number(v * 256) + " " + tiles), v -> c.memoryCacheTiles = v * 256));
 
-        // The block-level layer, which the client of this version does not draw yet.
-        this.list.addBig(slider("detail_radius", 0, BeyondTheHorizonConstants.MAX_DETAIL_RADIUS_CHUNKS, c.detailMaxRadiusChunks, ServerConfigScreen::plain, v -> c.detailMaxRadiusChunks = v));
-        this.list.addBig(toggle("detail_read_saved", c.detailReadSavedChunks, v -> c.detailReadSavedChunks = v));
-        this.list.addBig(toggle("detail_generate_unexplored", c.detailGenerateUnexplored, v -> c.detailGenerateUnexplored = v));
-        this.list.addBig(slider("detail_threads", 0, 8, c.detailThreads, ServerConfigScreen::auto, v -> c.detailThreads = v));
-        this.list.addBig(slider("detail_scan_depth", BeyondTheHorizonConstants.MIN_SCAN_DEPTH, BeyondTheHorizonConstants.MAX_SCAN_DEPTH, c.detailScanDepth, ServerConfigScreen::plain, v -> c.detailScanDepth = v));
-        this.list.addBig(slider("detail_scan_depth_end", BeyondTheHorizonConstants.MIN_SCAN_DEPTH, BeyondTheHorizonConstants.MAX_SCAN_DEPTH, c.detailScanDepthEnd, ServerConfigScreen::plain, v -> c.detailScanDepthEnd = v));
-        this.list.addBig(toggle("detail_ore_veins", c.detailOreVeins, v -> c.detailOreVeins = v));
     }
 }

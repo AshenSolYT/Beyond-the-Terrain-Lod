@@ -32,6 +32,18 @@ public final class Planner {
         public double reach = 4096.0;
         /** A tile splits while the camera is nearer than its size times this. */
         public double splitFactor = 3.0;
+        /**
+         * How much the view is zoomed in (1 = not): the tiles in the direction the camera looks (within {@link #coneHalf} and a margin)
+         * split that much earlier, the ones outside the view keep {@link #splitFactor}.
+         */
+        public double zoom = 1.0;
+        /** The direction the camera looks in (a unit vector) and the half angle of its view, the diagonal of the screen, in radians. */
+        public double lookX;
+        public double lookY;
+        public double lookZ = 1.0;
+        public double coneHalf = Math.PI;
+        /** Added to {@link #coneHalf} for the zoom detail, in radians. */
+        public double zoomMargin = 0.2;
         public int minLevel = 1;
         public int maxLevel = BeyondTheHorizonConstants.MAX_LEVEL;
         /** The square vanilla draws, in blocks: [ownX0, ownX1) by [ownZ0, ownZ1); empty when the end is not past the start. */
@@ -85,23 +97,45 @@ public final class Planner {
         }
     }
 
-    /** Orders {@link #want} by urgency, most urgent first. */
+    /** Orders {@link #want} by urgency, most urgent first: a heap sort of the two arrays in place, with no boxing. */
     public void sortWanted() {
         int n = this.wantCount;
-        Integer[] order = new Integer[n];
-        for (int i = 0; i < n; i++) {
-            order[i] = i;
+        long[] keys = this.want;
+        double[] scores = this.wantScore;
+        for (int i = n / 2 - 1; i >= 0; i--) {
+            siftDown(keys, scores, i, n);
         }
-        double[] score = this.wantScore;
-        Arrays.sort(order, (a, b) -> Double.compare(score[a], score[b]));
-        long[] keys = new long[n];
-        double[] scores = new double[n];
-        for (int i = 0; i < n; i++) {
-            keys[i] = this.want[order[i]];
-            scores[i] = score[order[i]];
+        for (int end = n - 1; end > 0; end--) {
+            swap(keys, scores, 0, end);
+            siftDown(keys, scores, 0, end);
         }
-        System.arraycopy(keys, 0, this.want, 0, n);
-        System.arraycopy(scores, 0, this.wantScore, 0, n);
+    }
+
+    /** Max-heap on the score, so that the sort ends smallest first. */
+    private static void siftDown(long[] keys, double[] scores, int root, int n) {
+        while (true) {
+            int child = 2 * root + 1;
+            if (child >= n) {
+                return;
+            }
+            if (child + 1 < n && scores[child + 1] > scores[child]) {
+                child++;
+            }
+            if (scores[child] <= scores[root]) {
+                return;
+            }
+            swap(keys, scores, root, child);
+            root = child;
+        }
+    }
+
+    private static void swap(long[] keys, double[] scores, int a, int b) {
+        long k = keys[a];
+        keys[a] = keys[b];
+        keys[b] = k;
+        double s = scores[a];
+        scores[a] = scores[b];
+        scores[b] = s;
     }
 
     /** Whether the area of the tile is completely drawn, or needs nothing. */
@@ -127,6 +161,10 @@ public final class Planner {
         double distance = Math.sqrt(horizontal * horizontal + altitude * altitude);
         long key = TilePos.pack(level, x, z);
         double factor = p.splitFactor * (this.splitPrev.contains(key) ? HYSTERESIS : 1.0);
+        // The extra detail of zooming goes only to what is in the view: the rest of the circle around the camera is not seen.
+        if (p.zoom > 1.0 && this.inView(minX + size * 0.5 - p.camX, REFERENCE_HEIGHT - p.camY, minZ + size * 0.5 - p.camZ, size)) {
+            factor *= p.zoom;
+        }
         boolean split = level > p.minLevel && distance < size * factor;
         if (split) {
             this.splitNow.add(key);
@@ -157,6 +195,19 @@ public final class Planner {
         // Not there either: it is asked for as the stand-in for what is missing, the finer tiles that are there stay.
         this.addWant(key, level, distance);
         return false;
+    }
+
+    /** Whether a tile, given by the vector from the camera to its middle and its size, lies in the direction the camera looks in. */
+    private boolean inView(double dx, double dy, double dz, long size) {
+        Params p = this.p;
+        double length = Math.sqrt(dx * dx + dy * dy + dz * dz);
+        if (length <= size) {
+            return true;
+        }
+        double cos = Math.max(-1.0, Math.min(1.0, (dx * p.lookX + dy * p.lookY + dz * p.lookZ) / length));
+        // The tile is as wide as its size over the distance seen from the camera; the ground under it can also be higher or lower than
+        // the height the middle is taken at, which the margin covers.
+        return Math.acos(cos) <= p.coneHalf + p.zoomMargin + Math.atan2(size * 0.75, length);
     }
 
     /** Draws the finer tiles that are loaded under a tile; whether they cover it completely. */

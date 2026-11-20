@@ -32,7 +32,7 @@ public final class TileData {
     private static final int MAX_ID_LENGTH = 256;
     public static final int MAX_ENCODED_SIZE = 64 * 1024;
     /** Sub-samples per sample on filtered (coarse) tiles. */
-    public static final int SUB_SAMPLES = 9;
+    public static final int SUB_SAMPLES = 4;
 
     public final short[] heights;
     public final byte[] biomes;

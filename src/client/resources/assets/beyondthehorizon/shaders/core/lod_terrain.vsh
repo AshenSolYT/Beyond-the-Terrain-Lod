@@ -13,7 +13,6 @@ layout(location = 0) in vec3 Position;
 layout(location = 1) in vec4 Color;
 
 layout(location = 0) out float sphericalVertexDistance;
-layout(location = 1) out float cylindricalVertexDistance;
 layout(location = 2) out vec4 vertexColor;
 #ifdef PIXEL_COLOR
 layout(location = 3) out vec2 localXZ;
@@ -22,15 +21,15 @@ layout(location = 3) out vec2 localXZ;
 // x, y: where on the sprite this corner is; z: which sprite (0 small, 1 big, 2 second big), -1 for a vertex that is no sprite.
 layout(location = 3) out vec3 spriteInfo;
 layout(location = 4) out vec3 spriteLight;
-// Where the vertex is seen from the camera, for the trees and structures that are not drawn inside the distance of vanilla chunks.
+// Where the vertex is seen from the camera, for the trees that are not drawn inside the distance of vanilla chunks.
 layout(location = 5) out vec2 relativeXZ;
 #endif
 
 void main() {
     vec3 pos = Position + ModelOffset;
     gl_Position = ProjMat * (ModelViewMat * vec4(pos, 1.0));
-    sphericalVertexDistance = fog_spherical_distance(pos);
-    cylindricalVertexDistance = fog_cylindrical_distance(pos);
+    // Radial fog: the full 3D distance from the camera (pos is camera-relative), so that the fog forms a sphere, not a cylinder.
+    sphericalVertexDistance = length(pos);
     vec4 light = sample_lightmap(Sampler2, ivec2(0, 240));
     vertexColor = vec4(Color.rgb * light.rgb, Color.a);
 #ifdef PIXEL_COLOR

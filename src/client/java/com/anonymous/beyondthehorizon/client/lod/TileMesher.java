@@ -5,6 +5,7 @@ import com.anonymous.beyondthehorizon.client.color.TileColors;
 import com.anonymous.beyondthehorizon.tile.TileData;
 import com.anonymous.beyondthehorizon.tile.TilePos;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Holder;
@@ -38,6 +39,17 @@ public final class TileMesher {
     private TileMesher() {
     }
 
+    /** The per-sample arrays of one tile, for one meshing thread. */
+    private static final class Scratch {
+        final float[] ground = new float[MeshBuilder.GRID];
+        final boolean[] voids = new boolean[MeshBuilder.GRID];
+        final boolean[] water = new boolean[MeshBuilder.GRID];
+        final int[] colors = new int[MeshBuilder.GRID];
+        final int[] waterColors = new int[MeshBuilder.GRID];
+    }
+
+    private static final ThreadLocal<Scratch> SCRATCH = ThreadLocal.withInitial(Scratch::new);
+
     public static MeshBuilder.@Nullable Mesh mesh(TileData data, TilePos pos, Registry<Biome> biomes, int seaLevel, int treeLevel, int treeDensity, int billboardLevel, int stepLevel) {
         int spacing = BeyondTheHorizonConstants.tileSize(pos.level()) / BeyondTheHorizonConstants.TILE_CELLS;
         List<Holder<Biome>> palette = new ArrayList<>(data.palette.size());
@@ -45,9 +57,12 @@ public final class TileMesher {
             palette.add(biomes.get(ResourceKey.create(Registries.BIOME, id)).orElse(null));
         }
         BlockPos.MutableBlockPos scratch = new BlockPos.MutableBlockPos();
-        float[] ground = new float[MeshBuilder.GRID];
-        boolean[] voids = new boolean[MeshBuilder.GRID];
-        boolean[] water = new boolean[MeshBuilder.GRID];
+        // The arrays of one tile are kept per thread, as the tile is meshed and they are not kept after it: the first loop sets ground, voids
+        // and water of every sample, the rest are cleared where the samples left gaps.
+        Scratch work = SCRATCH.get();
+        float[] ground = work.ground;
+        boolean[] voids = work.voids;
+        boolean[] water = work.water;
         boolean anyWater = false;
         boolean coarse = data.subBiomes != null;
         float waterLevel = seaLevel - (coarse ? WATER_UNDER_VANILLA : 0.0F);
@@ -66,8 +81,13 @@ public final class TileMesher {
             }
         }
         // Colors, from the slope of the ground at each sample.
-        int[] colors = new int[MeshBuilder.GRID];
-        int[] waterColors = anyWater ? new int[MeshBuilder.GRID] : null;
+        int[] colors = work.colors;
+        Arrays.fill(colors, 0);
+        int[] waterColors = null;
+        if (anyWater) {
+            waterColors = work.waterColors;
+            Arrays.fill(waterColors, 0);
+        }
         int baseX = (int) pos.minX();
         int baseZ = (int) pos.minZ();
         for (int z = 0; z < S; z++) {

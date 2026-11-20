@@ -80,6 +80,13 @@ public final class LodManager {
     private final ExecutorService workers;
     private final VertexArena arena = new VertexArena("terrain", ARENA_BLOCK_BYTES, GpuBuffer.USAGE_INDEX);
     private volatile int epoch;
+    /** How much the view is zoomed in (1 = not; 8 = eight times), from the field of view; the planner splits tiles that much earlier. */
+    private volatile double zoom = 1.0;
+    /** The direction the camera looks in and the half angle of its view (the screen's diagonal), set by the renderer every frame. */
+    private volatile double lookX;
+    private volatile double lookY;
+    private volatile double lookZ = 1.0;
+    private volatile double coneHalf = Math.PI;
     private BeyondTheHorizonPayloads.Hello hello;
     private ClientLevel level;
     private long tick;
@@ -99,6 +106,8 @@ public final class LodManager {
     private int radiusSampleCount;
     private float reach;
     private Tile[] drawList = new Tile[0];
+    /** The list tickTimed collects the tiles to draw in, kept so that it is not made again every tick. */
+    private final List<Tile> drawScratch = new ArrayList<>();
     /** The tiles of this world and dimension kept on disk, made when first needed; see {@link #cache}. */
     private TileCache cache;
     private Path worldCacheDirectory;
@@ -107,13 +116,10 @@ public final class LodManager {
     /** The pending tiles that are read from disk, not asked for from the server. */
     private final Set<Long> localKeys = new HashSet<>();
     private final ConcurrentLinkedQueue<Long> cacheFailed = new ConcurrentLinkedQueue<>();
-    /** The distant structures, a layer apart from the terrain, see StructureLayer. */
-    private final StructureLayer structures;
 
     public LodManager(Minecraft minecraft, ClientConfig config) {
         this.minecraft = minecraft;
         this.config = config;
-        this.structures = new StructureLayer(minecraft, config, this.arena);
         int threads = Mth.clamp(Runtime.getRuntime().availableProcessors() / 2, 1, 3);
         this.workers = Executors.newFixedThreadPool(threads, runnable -> {
             Thread thread = new Thread(runnable, "Beyond the Terrain mesher");
@@ -129,15 +135,6 @@ public final class LodManager {
 
     public VertexArena arena() {
         return this.arena;
-    }
-
-    /** The meshes of the distant structure layer, apart from {@link #drawList()}. */
-    public Tile[] structureTiles() {
-        return this.structures.tiles();
-    }
-
-    public void onStructureData(BeyondTheHorizonPayloads.StructureDataPayload payload) {
-        this.structures.onData(payload);
     }
 
     /** The tiles of the picture as of the last tick; drawable ones only are in it. */
@@ -334,7 +331,9 @@ public final class LodManager {
                 tile.stepIndexOffset = mesh.stepIndexOffset();
                 tile.stepIndexCount = mesh.stepIndexCount();
                 tile.minY = mesh.minY();
+                tile.surfaceMinY = mesh.surfaceMinY();
                 tile.maxY = mesh.maxY();
+                tile.waterLevel = mesh.waterLevel();
             }
             this.tiles.put(b.key, tile);
             this.pending.remove(b.key);
@@ -346,6 +345,18 @@ public final class LodManager {
     }
 
     // ---- per tick
+
+    /** Called by the renderer each frame with the field of view the game draws with and the one set in the options, both in radians. */
+    public void setView(double fovNow, double fovOption, double aspect, double lookX, double lookY, double lookZ) {
+        this.lookX = lookX;
+        this.lookY = lookY;
+        this.lookZ = lookZ;
+        this.coneHalf = Math.atan(Math.tan(Math.max(fovNow, 0.01) * 0.5) * Math.sqrt(1.0 + aspect * aspect));
+        double ratio = Math.tan(fovOption * 0.5) / Math.tan(Math.max(fovNow, 0.01) * 0.5);
+        // Only zooming in counts, in steps of about 1.4x up to 32x, so that the planner does not change its mind at every frame.
+        double steps = Math.floor(Math.log(Math.max(ratio, 1.0)) / Math.log(Math.sqrt(2.0)) + 0.25);
+        this.zoom = Math.min(32.0, Math.pow(Math.sqrt(2.0), Math.max(steps, 0.0)));
+    }
 
     public void tick() {
         long tickStart = System.nanoTime();
@@ -391,6 +402,13 @@ public final class LodManager {
         this.reach = reach;
         p.reach = reach;
         p.splitFactor = this.config.sharpness / 10.0;
+        p.zoom = this.zoom;
+        p.lookX = this.lookX;
+        p.lookY = this.lookY;
+        p.lookZ = this.lookZ;
+        p.coneHalf = this.coneHalf;
+        // A narrow view (zoomed in far) gets a narrow margin: the tiles it adds are the dear ones, and a wide margin would be most of the cone.
+        p.zoomMargin = Math.max(0.03, Math.min(0.2, 0.6 * this.coneHalf));
         p.minLevel = Math.max(Math.max(this.config.startLevel, this.hello.minLevel()), 0);
         // What vanilla draws: the square of chunks around the player that are all loaded, less two chunks all round, so that the
         // terrain at its edge is ready when chunks are unloaded or not built yet.
@@ -405,7 +423,8 @@ public final class LodManager {
         }
         this.planner.plan(p, key -> this.tiles.containsKey(key));
         Planner planner = this.planner;
-        List<Tile> draw = new ArrayList<>(planner.drawCount);
+        List<Tile> draw = this.drawScratch;
+        draw.clear();
         for (int i = 0; i < planner.drawCount; i++) {
             Tile tile = this.tiles.get(planner.draw[i]);
             if (tile != null) {
@@ -433,10 +452,12 @@ public final class LodManager {
         int surface = clientLevel.getHeight(Heightmap.Types.WORLD_SURFACE, Mth.floor(camX), Mth.floor(camZ));
         boolean underground = camY < surface - 48.0;
         this.drawList = underground ? new Tile[0] : draw.toArray(new Tile[0]);
-        this.structures.update(camX, camZ);
+        // The list is kept for the next tick, without references to the tiles.
+        draw.clear();
         this.request();
         this.checkHorizon();
         this.evict();
+        this.arena.growAhead();
     }
 
     /** The biggest square of chunks around the player's that vanilla has loaded completely. */
@@ -633,7 +654,6 @@ public final class LodManager {
     /** Forgets every tile, and makes the meshes still being built useless. */
     public void reset() {
         this.epoch++;
-        this.structures.reset();
         for (Tile tile : this.tiles.values()) {
             tile.close();
         }

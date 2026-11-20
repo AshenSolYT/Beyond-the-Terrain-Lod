@@ -7,6 +7,7 @@ import com.anonymous.beyondthehorizon.dimension.DimensionKind;
 import com.anonymous.beyondthehorizon.net.BeyondTheHorizonPayloads;
 import com.anonymous.beyondthehorizon.tile.DetailData;
 import com.anonymous.beyondthehorizon.tile.LoadOrder;
+import com.anonymous.beyondthehorizon.tile.TileData;
 import com.anonymous.beyondthehorizon.tile.TilePos;
 import com.mojang.logging.LogUtils;
 import it.unimi.dsi.fastutil.longs.Long2ObjectMap;
@@ -56,6 +57,18 @@ import org.slf4j.Logger;
  */
 public final class TileServer {
     private static final Logger LOGGER = LogUtils.getLogger();
+    /**
+     * Block-detail tiles and the virtual chunks made for them are switched off: the client draws stepped terrain instead, and the
+     * settings for them are gone. The code stays for the pregen command's checks and for old clients, which never get a detail radius.
+     */
+    private static final boolean DETAIL_ENABLED = false;
+    private static final int DETAIL_RADIUS_CHUNKS = 0;
+    private static final boolean DETAIL_GENERATE_UNEXPLORED = false;
+    private static final boolean DETAIL_READ_SAVED_CHUNKS = true;
+    /** Idle most of the time (threads end after 30 seconds without work). */
+    private static final int DETAIL_THREADS = 1;
+    /** Tiles of these levels and finer follow the real chunks of the world where there are any, see {@link RealSurface}. */
+    private static final int REAL_MAX_LEVEL = 2;
     private static final long DETAIL_CACHE_MS = 15_000L;
     /** Tiles with chunks that are not generated yet change as soon as someone explores there, so they are kept only briefly. */
     private static final long INCOMPLETE_DETAIL_CACHE_MS = 5_000L;
@@ -66,8 +79,12 @@ public final class TileServer {
     /** Horizontal speed in blocks per tick from which tiles load in the direction of movement. */
     private static final double FAST_MOTION = 0.4;
 
+    /** Tiles up to this level take the exact surface of the coarser tile around them, which must itself have exact samples (level 4). */
+    private static final int MAX_REUSE_LEVEL = 3;
     private final MinecraftServer server;
     private final ServerConfig config;
+    /** Set when the server stops: work still running checks it and ends, and nothing new starts. */
+    private volatile boolean closed;
     private final ThreadPoolExecutor executor;
     /**
      * Detailed tiles get their own threads. They mostly wait on region files, and sharing threads with the rough generator would put
@@ -103,7 +120,7 @@ public final class TileServer {
         int threads = config.resolvedThreads();
         // Detailed tiles are what the player sees up close, so they get the CPU before distant terrain; both stay below the game.
         this.executor = createExecutor("FarPlane tile generator #", threads, config.generatorPriority, this.workers);
-        this.detailExecutor = createExecutor("FarPlane detail reader #", config.resolvedDetailThreads(), Thread.NORM_PRIORITY - 1, this.workers);
+        this.detailExecutor = createExecutor("FarPlane detail reader #", DETAIL_THREADS, Thread.NORM_PRIORITY - 1, this.workers);
         TileDiskCache.clearIfOutdated(server.getWorldPath(LevelResource.ROOT));
         this.diskCache = config.diskCache ? new TileDiskCache(server.getWorldPath(LevelResource.ROOT), server.overworld().getSeed()) : null;
         this.virtualChunks = new VirtualChunkStore(server.getWorldPath(LevelResource.ROOT), server.overworld().getSeed());
@@ -114,7 +131,7 @@ public final class TileServer {
                 return this.size() > memoryLimit;
             }
         };
-        LOGGER.info("FarPlane tile server started with {} generator and {} detail thread(s)", threads, config.resolvedDetailThreads());
+        LOGGER.info("FarPlane tile server started with {} generator thread(s)", threads);
         if (ServerPerf.ON) {
             LOGGER.info("[FarPlane settings] server: {}", com.anonymous.beyondthehorizon.config.ConfigFiles.toCompactJson(config));
         }
@@ -146,7 +163,7 @@ public final class TileServer {
         if (ServerPlayNetworking.canSend(player, BeyondTheHorizonPayloads.Hello.TYPE)) {
             ServerPlayNetworking.send(player, new BeyondTheHorizonPayloads.Hello(
                 BeyondTheHorizonConstants.PROTOCOL_VERSION, this.config.enabled, this.config.maxDistance, this.config.minLevel,
-                this.config.detailEnabled, this.config.detailMaxRadiusChunks
+                DETAIL_ENABLED, DETAIL_RADIUS_CHUNKS
             ));
         }
     }
@@ -223,8 +240,13 @@ public final class TileServer {
                 rough += state.roughQueue.size() + state.roughInFlight;
                 detail += state.detailQueue.size() + state.detailInFlight;
             }
-            ServerPerf.summary(this.server.getAverageTickTimeNanos() / 1e6, rough, detail);
-            ServerPerf.threads(this.executor.getMaximumPoolSize(), this.detailExecutor.getMaximumPoolSize(), this.config.inFlightLimit());
+            if (ServerPerf.idle(rough, detail)) {
+                // Nothing queued, no surface searches and the threads at 0%: no lines, so an idle game does not fill the log.
+                ServerPerf.skipWindow();
+            } else {
+                ServerPerf.summary(this.server.getAverageTickTimeNanos() / 1e6, rough, detail);
+                ServerPerf.threads(this.executor.getMaximumPoolSize(), this.detailExecutor.getMaximumPoolSize(), this.config.inFlightLimit());
+            }
         }
         if (ServerPerf.ON) {
             for (PlayerState state : this.players.values()) {
@@ -259,7 +281,7 @@ public final class TileServer {
                 this.chunkSummaries.remove(dimension, chunk);
                 RegionFiles.markReal(entry.getKey(), ChunkPos.getX(chunk), ChunkPos.getZ(chunk));
             }
-            double radius = this.config.detailMaxRadiusChunks * 16.0 + 64.0;
+            double radius = DETAIL_RADIUS_CHUNKS * 16.0 + 64.0;
             for (ServerPlayer player : this.server.getPlayerList().getPlayers()) {
                 if (player.level().dimension() != entry.getKey() || !ServerPlayNetworking.canSend(player, BeyondTheHorizonPayloads.DetailDirty.TYPE)) {
                     continue;
@@ -283,7 +305,7 @@ public final class TileServer {
      * smoothly; chunks that already exist or were made before are skipped.
      */
     boolean startPregen(CommandSourceStack source, ServerLevel level, int centerX, int centerZ, int radius) {
-        if (!this.config.detailGenerateUnexplored || !this.virtualChunks.supports(level)) {
+        if (!DETAIL_GENERATE_UNEXPLORED || !this.virtualChunks.supports(level)) {
             source.sendFailure(BeyondTheHorizonCommand.message("disabled",
                 "Detailed terrain for unexplored places is turned off in the server config or not possible in this dimension"));
             return false;
@@ -364,16 +386,22 @@ public final class TileServer {
             return;
         }
         TilePos tile = running.tiles.get(running.next++);
-        Long2ObjectMap<LevelChunk> loaded = this.loadedChunks(running.level, tile);
+        Long2ObjectMap<LevelChunk> loaded = this.loadedChunks(running.level, tile, 0);
         running.busy = true;
         try {
             this.detailExecutor.execute(() -> {
+                if (this.closed) {
+                    return;
+                }
+                VirtualChunkStore.beginTask(() -> this.closed);
                 try {
                     this.produceDetail(running.level, tile, loaded, this.virtualChunks);
                 } catch (WorkThrottle.Cancelled e) {
                     return;
                 } catch (Exception e) {
                     LOGGER.warn("Failed to pre-generate detailed tile {}", tile, e);
+                } finally {
+                    VirtualChunkStore.endTask();
                 }
                 this.server.execute(() -> {
                     running.busy = false;
@@ -668,7 +696,10 @@ public final class TileServer {
     }
 
     public void onDisconnect(UUID player) {
-        this.players.remove(player);
+        PlayerState state = this.players.remove(player);
+        if (state != null) {
+            state.gone = true;
+        }
     }
 
     public void onRequest(ServerPlayer player, int[] requests) {
@@ -691,10 +722,10 @@ public final class TileServer {
     private ChunkSummary.Scan scan(ServerLevel level) {
         DimensionKind kind = DimensionKind.of(level);
         Integer chosen = this.ownerScanDepths.get(kind);
-        int depth = chosen != null ? chosen : kind == DimensionKind.END ? this.config.detailScanDepthEnd : this.config.detailScanDepth;
+        int depth = chosen != null ? chosen : kind == DimensionKind.END ? BeyondTheHorizonConstants.DEFAULT_END_SCAN_DEPTH : BeyondTheHorizonConstants.DEFAULT_SCAN_DEPTH;
         // Ore veins are a setting of the overworld only; elsewhere chunks are made as the world makes them.
         Boolean veins = this.ownerOreVeins.get(kind);
-        boolean oreVeins = kind != DimensionKind.OVERWORLD || (veins != null ? veins : this.config.detailOreVeins);
+        boolean oreVeins = kind != DimensionKind.OVERWORLD || (veins != null ? veins : false);
         return new ChunkSummary.Scan(depth, kind == DimensionKind.END, oreVeins);
     }
 
@@ -715,7 +746,7 @@ public final class TileServer {
         }
         int minLevel = detail ? BeyondTheHorizonConstants.DETAIL_MIN_LEVEL : this.config.minLevel;
         int maxLevel = detail ? BeyondTheHorizonConstants.DETAIL_MAX_LEVEL : BeyondTheHorizonConstants.MAX_LEVEL;
-        double detailRadius = this.config.detailMaxRadiusChunks * 16.0;
+        double detailRadius = DETAIL_RADIUS_CHUNKS * 16.0;
         boolean wholeWorld = this.config.maxDistance >= BeyondTheHorizonConstants.MAX_LOD_DISTANCE;
         for (int i = 0; i + 2 < requests.length; i += 3) {
             if (state.queue(detail).size() >= this.config.maxQueuedRequestsPerPlayer) {
@@ -772,19 +803,14 @@ public final class TileServer {
         if (this.distantPregen != null) {
             return 1;
         }
-        int calm = this.config.resolvedCalmDetailThreads();
-        int all = this.config.resolvedDetailThreads();
-        if (BeyondTheHorizonConstants.ANDROID) {
-            all = Math.clamp(all - (this.server.getPlayerList().getViewDistance() - 2) / 3, calm, all);
-        }
-        return calm + Math.round((all - calm) * state.urgency);
+        return DETAIL_THREADS;
     }
 
     /** {@code refineLimit}: at most this many tiles in flight once only tiles that refine distant terrain are left to hand out. */
     private void pump(ServerPlayer player, PlayerState state, boolean detail, int limit, int refineLimit) {
         UUID playerId = player.getUUID();
         List<Job> queue = state.queue(detail);
-        double detailRadius = this.config.detailMaxRadiusChunks * 16.0 + 64.0;
+        double detailRadius = DETAIL_RADIUS_CHUNKS * 16.0 + 64.0;
         if (ServerPerf.ON && state.inFlight(detail) >= limit && !queue.isEmpty()) {
             (detail ? ServerPerf.STOP_DETAIL_LIMIT : ServerPerf.STOP_ROUGH_LIMIT).incrementAndGet();
         }
@@ -819,17 +845,24 @@ public final class TileServer {
                 continue;
             }
             // Loaded chunks are looked up here on the server thread; the worker only reads blocks from them.
-            Long2ObjectMap<LevelChunk> loaded = job.detail() ? this.loadedChunks(level, job.pos()) : null;
-            VirtualChunkStore virtual = job.detail() && state.generateVirtual && this.config.detailGenerateUnexplored ? this.virtualChunks : null;
+            Long2ObjectMap<LevelChunk> loaded = job.detail() ? this.loadedChunks(level, job.pos(), 0) : job.pos().level() <= REAL_MAX_LEVEL ? this.loadedChunks(level, job.pos(), 1) : null;
+            VirtualChunkStore virtual = job.detail() && state.generateVirtual && DETAIL_GENERATE_UNEXPLORED ? this.virtualChunks : null;
             state.changeInFlight(detail, 1);
             try {
                 (job.detail() ? this.detailExecutor : this.executor).execute(() -> {
                     byte[] result = null;
+                    if (this.closed) {
+                        return;
+                    }
+                    if (job.detail()) {
+                        // Detailed tiles stop making virtual chunks once the player is gone or in another dimension.
+                        VirtualChunkStore.beginTask(() -> this.closed || state.gone || state.dimension != dimension);
+                    }
                     try {
                         long start = ServerPerf.ON ? System.nanoTime() : 0L;
                         long cpu = ServerPerf.cpu();
                         long paused = WorkThrottle.pausedNanos();
-                        result = job.detail() ? this.produceDetail(level, job.pos(), loaded, virtual) : this.produce(level, job.pos());
+                        result = job.detail() ? this.produceDetail(level, job.pos(), loaded, virtual) : this.produce(level, job.pos(), loaded);
                         if (ServerPerf.ON) {
                             (job.detail() ? ServerPerf.DETAIL : ServerPerf.ROUGH).add(System.nanoTime() - start);
                             if (job.detail()) {
@@ -844,6 +877,8 @@ public final class TileServer {
                         return;
                     } catch (Exception e) {
                         LOGGER.warn("Failed to generate tile {} in {}", job.pos(), dimension.identifier(), e);
+                    } finally {
+                        VirtualChunkStore.endTask();
                     }
                     byte[] finalResult = result;
                     long finishedAt = ServerPerf.ON ? System.nanoTime() : 0L;
@@ -913,11 +948,12 @@ public final class TileServer {
         return latest instanceof ImposterProtoChunk imposter ? imposter.getWrapped() : null;
     }
 
-    private Long2ObjectMap<LevelChunk> loadedChunks(ServerLevel level, TilePos pos) {
+    /** {@code extra}: chunks past the tile's far edge too, where its last samples lie. */
+    private Long2ObjectMap<LevelChunk> loadedChunks(ServerLevel level, TilePos pos, int extra) {
         Long2ObjectOpenHashMap<LevelChunk> chunks = new Long2ObjectOpenHashMap<>();
         int minChunkX = (int) Math.floorDiv(pos.minX(), 16L);
         int minChunkZ = (int) Math.floorDiv(pos.minZ(), 16L);
-        int count = Math.max(1, pos.size() / 16);
+        int count = Math.max(1, pos.size() / 16) + extra;
         for (int dz = 0; dz < count; dz++) {
             for (int dx = 0; dx < count; dx++) {
                 long key = ChunkPos.pack(minChunkX + dx, minChunkZ + dz);
@@ -945,7 +981,7 @@ public final class TileServer {
                 return cached.data();
             }
         }
-        DetailData data = DetailGenerator.generate(level, pos, loaded, this.config.detailReadSavedChunks ? this.chunkSummaries : null, virtual, scan);
+        DetailData data = DetailGenerator.generate(level, pos, loaded, DETAIL_READ_SAVED_CHUNKS ? this.chunkSummaries : null, virtual, scan);
         long encodeStart = ServerPerf.ON ? System.nanoTime() : 0L;
         byte[] encoded = data.encode();
         if (ServerPerf.ON) {
@@ -961,7 +997,77 @@ public final class TileServer {
         return encoded;
     }
 
-    private byte[] produce(ServerLevel level, TilePos pos) {
+    /**
+     * The tile one level coarser around a fine tile, if it was made a moment ago and is still in the memory cache: tiles are asked for
+     * from the biggest down, so it usually is. Nothing is read from disk for it.
+     */
+    private @Nullable TileData coarserTile(Identifier dimension, TilePos pos) {
+        if (pos.level() > MAX_REUSE_LEVEL) {
+            return null;
+        }
+        TilePos parent = new TilePos(pos.level() + 1, pos.x() >> 1, pos.z() >> 1);
+        byte[] cached;
+        synchronized (this.memoryCache) {
+            cached = this.memoryCache.get(new CacheKey(dimension, parent.pack()));
+        }
+        if (cached == null) {
+            return null;
+        }
+        try {
+            return TileData.decode(cached);
+        } catch (java.io.IOException | RuntimeException e) {
+            return null;
+        }
+    }
+
+    /**
+     * The tile as the client gets it. Fine tiles follow the real chunks of the world where there are any (explored terrain, what players
+     * built); that is laid over the generated tile for this request only: the generated tile is what is cached, and it must not hold
+     * what a player may change.
+     */
+    private byte[] produce(ServerLevel level, TilePos pos, @Nullable Long2ObjectMap<LevelChunk> loaded) {
+        byte[] encoded = this.produceGenerated(level, pos);
+        if (pos.level() > REAL_MAX_LEVEL || loaded == null || !TileGenerator.supports(level)) {
+            return encoded;
+        }
+        try {
+            if (!anyRealChunk(level, pos, loaded)) {
+                return encoded;
+            }
+            TileData generated = TileData.decode(encoded);
+            ChunkSummary.Scan scan = this.scan(level);
+            TileData real = RealSurface.apply(level, pos, generated, new DetailGenerator.RealChunks(level, loaded, this.chunkSummaries, scan), this.config.builds && pos.level() <= this.config.buildsLevel);
+            return real == generated ? encoded : real.encode();
+        } catch (WorkThrottle.Cancelled e) {
+            throw e;
+        } catch (java.io.IOException | RuntimeException e) {
+            LOGGER.debug("Real chunks were not used for tile {}", pos, e);
+            return encoded;
+        }
+    }
+
+    /** Whether a chunk the tile's samples lie over is loaded or may be saved in a region file. */
+    private static boolean anyRealChunk(ServerLevel level, TilePos pos, Long2ObjectMap<LevelChunk> loaded) {
+        if (!loaded.isEmpty()) {
+            return true;
+        }
+        int minChunkX = (int) Math.floorDiv(pos.minX(), 16L);
+        int minChunkZ = (int) Math.floorDiv(pos.minZ(), 16L);
+        int count = Math.max(1, pos.size() / 16) + 1;
+        // Region files cover 32 x 32 chunks: a few checks, which are remembered, settle it.
+        for (int dz = 0; dz < count; dz += 32) {
+            for (int dx = 0; dx < count; dx += 32) {
+                if (RegionFiles.mayContain(level, minChunkX + dx, minChunkZ + dz)
+                    || RegionFiles.mayContain(level, minChunkX + Math.min(dx + 31, count - 1), minChunkZ + Math.min(dz + 31, count - 1))) {
+                    return true;
+                }
+            }
+        }
+        return RegionFiles.mayContain(level, minChunkX + count - 1, minChunkZ + count - 1)
+            || RegionFiles.mayContain(level, minChunkX, minChunkZ + count - 1) || RegionFiles.mayContain(level, minChunkX + count - 1, minChunkZ);
+    }
+
+    private byte[] produceGenerated(ServerLevel level, TilePos pos) {
         Identifier dimension = level.dimension().identifier();
         CacheKey key = new CacheKey(dimension, pos.pack());
         synchronized (this.memoryCache) {
@@ -976,7 +1082,7 @@ public final class TileServer {
         }
         if (encoded == null) {
             int epoch = this.cacheEpoch.get();
-            encoded = TileGenerator.generate(level, pos).encode();
+            encoded = TileGenerator.generate(level, pos, this.coarserTile(dimension, pos)).encode();
             if (this.diskCache != null && !this.clearing.get() && this.cacheEpoch.get() == epoch) {
                 this.diskCache.write(dimension, pos, encoded);
             }
@@ -995,7 +1101,10 @@ public final class TileServer {
         state.changeInFlight(job.detail(), -1);
         ServerPlayer player = this.server.getPlayerList().getPlayer(playerId);
         if (player == null) {
-            this.players.remove(playerId);
+            PlayerState gone = this.players.remove(playerId);
+            if (gone != null) {
+                gone.gone = true;
+            }
             return;
         }
         TilePos pos = job.pos();
@@ -1016,7 +1125,12 @@ public final class TileServer {
      * next checkpoint. Waits a few seconds for them, so nothing is written to the world folder after the world is closed.
      */
     public void close() {
+        this.closed = true;
         this.distantPregen = null;
+        this.pregen = null;
+        this.players.values().forEach(state -> state.gone = true);
+        // Ends the virtual chunk work on the helper threads too, which are no workers of the executors.
+        WorkThrottle.stopAll();
         this.workers.forEach(WorkThrottle.Worker::cancel);
         this.executor.getQueue().clear();
         this.detailExecutor.getQueue().clear();
@@ -1213,7 +1327,9 @@ public final class TileServer {
     }
 
     private static final class PlayerState {
-        private @Nullable ResourceKey<Level> dimension;
+        private volatile @Nullable ResourceKey<Level> dimension;
+        /** Set when the player has left, read by the worker threads. */
+        private volatile boolean gone;
         private final List<Job> roughQueue = new ArrayList<>();
         private final List<Job> detailQueue = new ArrayList<>();
         private final LongOpenHashSet queued = new LongOpenHashSet();

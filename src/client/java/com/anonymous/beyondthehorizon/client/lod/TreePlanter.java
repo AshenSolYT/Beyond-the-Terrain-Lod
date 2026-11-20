@@ -220,7 +220,8 @@ public final class TreePlanter {
         int cell = spacing <= 4 ? BASE_CELL : BASE_CELL * spacing / 4;
         float clump = (float) Math.sqrt(cell / (double) BASE_CELL);
         double cells = (double) cell * cell / (BASE_CELL * BASE_CELL);
-        Out out = new Out();
+        Out out = OUT.get();
+        out.reset();
         int trees = 0;
         float maxY = -Float.MAX_VALUE;
         int gz1 = Math.floorDiv(baseZ + extent - 1, cell);
@@ -292,6 +293,11 @@ public final class TreePlanter {
         return trees == 0 ? null : new Trees(Arrays.copyOf(out.xyz, out.v * 3), Arrays.copyOf(out.col, out.v), Arrays.copyOf(out.idx, out.n), out.v, out.n, maxY);
     }
 
+    /** Most floats the kept arrays of a thread may have: a thread that grew them beyond this starts over for the next tile. */
+    private static final int KEEP_FLOATS = 4096 * 3 * 16;
+    /** One set of buffers per meshing thread, the trees of a tile are copied out of it at the end. */
+    private static final ThreadLocal<Out> OUT = ThreadLocal.withInitial(Out::new);
+
     /** The vertices and triangles of the trees of one tile, grown as needed. */
     private static final class Out {
         float[] xyz = new float[4096 * 3];
@@ -299,6 +305,16 @@ public final class TreePlanter {
         short[] idx = new short[6144];
         int v;
         int n;
+
+        void reset() {
+            this.v = 0;
+            this.n = 0;
+            if (this.xyz.length > KEEP_FLOATS) {
+                this.xyz = new float[4096 * 3];
+                this.col = new int[4096];
+                this.idx = new short[6144];
+            }
+        }
 
         /** A face of four corners, drawn from both sides (the pass has no culling). */
         void quad(float x0, float y0, float z0, float x1, float y1, float z1, float x2, float y2, float z2, float x3, float y3, float z3, int argb) {

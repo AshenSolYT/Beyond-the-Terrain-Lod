@@ -141,8 +141,8 @@ public final class LodFog {
 
     /** Where the fog ends for a tile whose nearest point lies at these distances: beyond it the tile is all fog color. */
     public boolean hides(double distance, double horizontal, double vertical) {
-        double measured = this.round ? distance : Math.max(horizontal, vertical);
-        return distance > this.environmentalEnd || measured > this.renderDistanceEnd;
+        // Radial fog: the 3D distance to the nearest point of the tile, whatever the shape flag says.
+        return distance > this.environmentalEnd || distance > this.renderDistanceEnd;
     }
 
     /** Writes this frame's fog for the LOD shaders; must happen before the pass that uses it is opened. */

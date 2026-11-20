@@ -30,8 +30,8 @@ public final class PerfDebugEntry implements DebugScreenEntry {
             PerfStats.msPerCall(PerfStats.Timer.TERRAIN), PerfStats.msPerCall(PerfStats.Timer.DEPTH), PerfStats.msPerSecond(PerfStats.Timer.UPLOAD) / Math.max(1.0, PerfStats.callsPerSecond(PerfStats.Timer.TERRAIN))));
         lines.add(String.format(Locale.ROOT, "Before the passes %.2f ms per frame (what is seen, transforms) | planner tick %.2f ms per tick",
             PerfStats.msPerCall(PerfStats.Timer.PREP), PerfStats.msPerCall(PerfStats.Timer.TICK)));
-        lines.add(String.format(Locale.ROOT, "Drawn: %d ground draws, %d tree meshes (%s vertices), %d structure meshes (%s vertices)",
-            PerfStats.groundDraws, PerfStats.treeMeshes, count(PerfStats.treeVertices), PerfStats.structureMeshes, count(PerfStats.structureVertices)));
+        lines.add(String.format(Locale.ROOT, "Drawn: %d ground draws, %d tree meshes (%s vertices)",
+            PerfStats.groundDraws, PerfStats.treeMeshes, count(PerfStats.treeVertices)));
         lines.add(String.format(Locale.ROOT, "Tiles: %d held, %d waiting for a mesh | meshing %.1f tiles/s, %.1f ms each, %.0f ms of worker time per second",
             manager.tileCount(), manager.pendingCount(), PerfStats.callsPerSecond(PerfStats.Timer.MESH), PerfStats.msPerCall(PerfStats.Timer.MESH), PerfStats.msPerSecond(PerfStats.Timer.MESH)));
         List<String> off = new ArrayList<>();

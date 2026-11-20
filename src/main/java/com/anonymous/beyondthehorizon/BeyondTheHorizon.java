@@ -3,7 +3,6 @@ package com.anonymous.beyondthehorizon;
 import com.anonymous.beyondthehorizon.config.ServerConfig;
 import com.anonymous.beyondthehorizon.net.BeyondTheHorizonPayloads;
 import com.anonymous.beyondthehorizon.server.BeyondTheHorizonCommand;
-import com.anonymous.beyondthehorizon.server.StructureServer;
 import com.anonymous.beyondthehorizon.server.TileServer;
 import net.fabricmc.api.ModInitializer;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
@@ -15,7 +14,6 @@ import org.jspecify.annotations.Nullable;
 
 public class BeyondTheHorizon implements ModInitializer {
     private static @Nullable TileServer tileServer;
-    private static @Nullable StructureServer structureServer;
 
     /** The tile server of the world this game is running (singleplayer or dedicated server), if any. */
     public static @Nullable TileServer tileServer() {
@@ -27,15 +25,9 @@ public class BeyondTheHorizon implements ModInitializer {
         BeyondTheHorizonPayloads.register();
 
         ServerLifecycleEvents.SERVER_STARTED.register(server -> {
-            TileServer started = new TileServer(server, ServerConfig.load());
-            tileServer = started;
-            structureServer = new StructureServer(server, started.config());
+            tileServer = new TileServer(server, ServerConfig.load());
         });
         ServerLifecycleEvents.SERVER_STOPPING.register(server -> {
-            if (structureServer != null) {
-                structureServer.close();
-                structureServer = null;
-            }
             if (tileServer != null) {
                 tileServer.close();
                 tileServer = null;
@@ -69,11 +61,6 @@ public class BeyondTheHorizon implements ModInitializer {
         ServerPlayNetworking.registerGlobalReceiver(BeyondTheHorizonPayloads.DetailRequest.TYPE, (payload, context) -> {
             if (tileServer != null) {
                 tileServer.onDetailRequest(context.player(), payload.requests(), payload.generate(), payload.urgency() / 100.0F, payload.scanDepth(), payload.oreVeins());
-            }
-        });
-        ServerPlayNetworking.registerGlobalReceiver(BeyondTheHorizonPayloads.StructureRequest.TYPE, (payload, context) -> {
-            if (structureServer != null) {
-                structureServer.onRequest(context.player(), payload.regions());
             }
         });
         ServerPlayNetworking.registerGlobalReceiver(BeyondTheHorizonPayloads.ClearCache.TYPE, (payload, context) -> {

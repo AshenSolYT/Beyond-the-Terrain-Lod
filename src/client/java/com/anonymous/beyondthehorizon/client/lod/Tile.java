@@ -29,11 +29,13 @@ public final class Tile {
     public int stepIndexOffset = -1;
     public int stepIndexCount;
     public float minY;
+    /** The lowest point of the ground itself, without the skirt below the tile's edges: what the horizon culling treats as the tile's floor. */
+    public float surfaceMinY;
     public float maxY;
+    /** The height of the water surface of this tile's mesh (meaningful when it has water). */
+    public float waterLevel;
     /** The tick it was last in the picture or asked for; among the tiles outside the picture the farthest go first when there are too many. */
     public long lastUsed;
-    /** A mesh of the distant structure layer, not a terrain tile: drawn by the renderer's structure pass only, see StructureLayer. */
-    public boolean structure;
 
     public Tile(TilePos pos) {
         this.key = pos.pack();
@@ -41,15 +43,6 @@ public final class Tile {
         this.minX = pos.minX();
         this.minZ = pos.minZ();
         this.size = pos.size();
-    }
-
-    /** A tile of the structure layer: it has no position in the terrain's grid, only the corner and the size of its boxes. */
-    public Tile(long key, double minX, double minZ, double size) {
-        this.key = key;
-        this.pos = null;
-        this.minX = minX;
-        this.minZ = minZ;
-        this.size = size;
     }
 
     public boolean drawable() {
