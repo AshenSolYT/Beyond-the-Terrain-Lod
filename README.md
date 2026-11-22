@@ -31,7 +31,6 @@ See your terrain well... beyond your terrain with a performance cost that depend
 
 * [x] Faster Heightmap generation
 * [x] Better stepped terrain detail
-* [x] Higher detail when zooming in with a spyglass or a zoom mod
 * [x] Terrain colors need to be reworked to be a little more accurate
 * [x] Shader pack support "*Only internal developement versions will be available soon*"
 * [ ] Faster Stepped Heightmap generation
