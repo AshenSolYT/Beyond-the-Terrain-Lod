@@ -1,0 +1,1006 @@
+package com.anonymous.beyondthehorizon.server;
+
+import com.anonymous.beyondthehorizon.WorkThrottle;
+import com.anonymous.beyondthehorizon.BeyondTheHorizonConstants;
+import com.anonymous.beyondthehorizon.tile.TileData;
+import com.anonymous.beyondthehorizon.tile.TilePos;
+import net.minecraft.core.Holder;
+import net.minecraft.core.QuartPos;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.util.Mth;
+import net.minecraft.world.level.NoiseColumn;
+import net.minecraft.world.level.biome.Biome;
+import net.minecraft.world.level.biome.BiomeResolver;
+import net.minecraft.world.level.biome.BiomeSource;
+import net.minecraft.world.level.biome.Climate;
+import net.minecraft.world.level.biome.MultiNoiseBiomeSource;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.chunk.ChunkGenerator;
+import net.minecraft.world.level.levelgen.NoiseBasedChunkGenerator;
+import net.minecraft.world.level.levelgen.NoiseGeneratorSettings;
+import net.minecraft.world.level.levelgen.NoiseRouter;
+import net.minecraft.world.level.levelgen.RandomState;
+import net.minecraft.world.level.levelgen.densityfunction.DensityBuffer;
+import net.minecraft.world.level.levelgen.densityfunction.DensityFunction;
+import net.minecraft.world.level.levelgen.densityfunction.DensityFunctions;
+import net.minecraft.world.level.levelgen.densityfunction.DensitySampler;
+import net.minecraft.world.level.levelgen.densityfunction.DensityVolume;
+import net.minecraft.world.level.levelgen.densityfunction.DfRewriteRule;
+import net.minecraft.world.level.levelgen.densityfunction.DensityBufferPool;
+import net.minecraft.world.level.levelgen.densityfunction.SamplerContext;
+import net.minecraft.world.level.levelgen.densityfunction.op.InterpolatedFunction;
+import net.minecraft.world.level.levelgen.Noises;
+import net.minecraft.world.level.levelgen.synth.Noise;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.biome.Biomes;
+import org.jspecify.annotations.Nullable;
+
+/**
+ * Distant terrain of the overworld (and worlds like it): the highest solid ground under an open sky, with oceans at sea level.
+ * <p>
+ * The samples of a tile form a regular grid, so the climate the biomes come from is sampled for the whole grid at once. Everything
+ * sampled point by point afterwards (the surface, the depth of a biome) goes through the same caching context, which serves the parts
+ * that only depend on x and z, shared by all of them, from that grid. The surface itself is not sampled as a grid: it contains
+ * interpolated noise, which vanilla samples on its full cell grid for any spacing, far too much for samples thousands of blocks apart.
+ */
+final class OverworldTileGenerator {
+    private static final org.slf4j.Logger LOGGER = com.mojang.logging.LogUtils.getLogger();
+    private static final int S = BeyondTheHorizonConstants.TILE_SAMPLES;
+    /**
+     * From this level on (32+ blocks between samples) one sample per cell would pick random islands and hills, which looks like
+     * noise from far away. Such cells are sampled on a 2x2 grid and the client averages the colors.
+     */
+    private static final int FILTER_LEVEL = 5;
+    /** From this level on the generator's 2D surface estimate is used instead of an exact search, where it is close enough. */
+    private static final int ESTIMATE_LEVEL = 5;
+    /**
+     * From this level on (4+ blocks between samples) the surface is searched in the terrain without caves, see State.far: the caves
+     * are most of the work of the final density, and a cave that breaks through the surface cannot be told apart at this spacing.
+     */
+    private static final int FAR_LEVEL = 2;
+    /** Largest average difference between the estimate and the exact surface for the estimate to be trusted on a tile. */
+    private static final int MAX_ESTIMATE_ERROR = 48;
+    /**
+     * Up to this sample spacing the surface search starts at the previous sample's height, which is closer than the 2D estimate on
+     * fine tiles and saves both the estimate and most of the density samples. Farther apart, neighbours say little about each other.
+     */
+    private static final int NEIGHBOUR_HINT_SPACING = 4;
+    /** Grids are sampled from this spacing on, where every sample is on its own quart and biomes can be read from the grid. */
+    private static final int GRID_SPACING = 4;
+
+    /**
+     * The estimate is often a few blocks off, which hardly shows on hills but decides between land and sea on flat ground near the sea
+     * level: plains and forests there would turn into sea on whole tiles. Estimates this close to the sea level are checked exactly.
+     */
+    private static final int SEA_CHECK = 40;
+
+    /**
+     * The estimate's error (exact surface minus estimate) is much the same from one sample to the next, so the search starts at the
+     * estimate plus the error of the sample before, not at the bare estimate: a few density samples saved on every search. Clamped,
+     * as the search finds the surface from any start, only slower from a far one.
+     */
+    private static final int MAX_HINT_ERROR = 96;
+    /**
+     * Averaged (filtered) tiles do not need the surface to the block: their samples are averaged and smoothed, and what the eye sees is
+     * the shape. Away from the sea level their surface is found on a grid of this many blocks (see DensitySurface.surface), which drops
+     * the last bisection steps of every search. The grid is fixed, so two tiles that share a sample find the same height whatever their
+     * hint was; tiles of other levels never reuse each other's samples (see reuse in generate).
+     */
+    private static final int COARSE_GRAIN = 4;
+    /** From this level on (128+ blocks between samples) the grid is twice as coarse. */
+    private static final int COARSER_LEVEL = 7;
+
+    private OverworldTileGenerator() {
+    }
+
+    private static boolean nearSea(int estimate, int seaLevel) {
+        return Math.abs(estimate - seaLevel) <= SEA_CHECK;
+    }
+
+    /**
+     * Corrected estimates this far under the sea level are checked exactly: the correction comes from the middle of the cells around,
+     * and on a rugged coast a hill there can still be estimated a few blocks low, which would draw it as water.
+     */
+    private static final int SHALLOW_CHECK = 4;
+    /** Largest difference between the estimate and the exact surface at any one probe for the estimate to be trusted on a tile. */
+    private static final int MAX_PROBE_ERROR = 96;
+
+    static TileData generate(
+        ServerLevel level, TilePos pos, ChunkGenerator generator, RandomState randomState, TileGenerator.BiomeLookup biomes, @Nullable TileData parent
+    ) {
+        long cpu = ServerPerf.cpu();
+        int minY = level.getMinY();
+        int maxY = level.getMaxY();
+        int spacing = 1 << pos.level();
+        long baseX = pos.minX();
+        long baseZ = pos.minZ();
+
+        short[] heights = new short[BeyondTheHorizonConstants.TILE_SAMPLE_COUNT];
+        byte[] biomeIndices = new byte[BeyondTheHorizonConstants.TILE_SAMPLE_COUNT];
+        byte[] flags = new byte[BeyondTheHorizonConstants.TILE_SAMPLE_COUNT];
+        byte[] depths = new byte[BeyondTheHorizonConstants.TILE_SAMPLE_COUNT];
+        TileGenerator.Palette palette = new TileGenerator.Palette();
+
+        State state = State.of(level, generator, randomState, minY, maxY);
+        DensitySurface fast = state.fast;
+        if (fast == null) {
+            exactColumns(level, pos, generator, randomState, biomes, heights, biomeIndices, flags, depths, palette);
+            return new TileData(heights, biomeIndices, flags, palette.ids, null, null, depths);
+        }
+        boolean filtered = pos.level() >= FILTER_LEVEL;
+        // Sub-samples sit on whole quarts, so their biomes come from the same grid as their heights.
+        int subStep = filtered ? Math.max(GRID_SPACING, (spacing / 4) & -GRID_SPACING) : 0;
+        boolean gridded = spacing >= GRID_SPACING && insideWorld(baseX - subStep, baseZ - subStep, (S - 1L) * spacing + 2L * subStep);
+        ClimateGrid climate = gridded ? state.climate : null;
+        // Far tiles look for the surface in the terrain without caves, which is much cheaper to sample, see State.far.
+        DensitySurface far = state.far;
+        // The search of the finer tiles: the final density with its caves, from FAR_LEVEL on the terrain without them.
+        DensitySurface search = pos.level() >= FAR_LEVEL ? far : fast;
+        boolean estimateOnly = pos.level() >= ESTIMATE_LEVEL && fast.estimateMatches(baseX, baseZ, BeyondTheHorizonConstants.TILE_CELLS * spacing);
+
+        if (filtered) {
+            byte[] subBiomes = new byte[BeyondTheHorizonConstants.TILE_SAMPLE_COUNT * TileData.SUB_SAMPLES];
+            short[] subWater = new short[BeyondTheHorizonConstants.TILE_SAMPLE_COUNT];
+            int[] land = state.land();
+            long[] landSum = state.landSum();
+            // Sum of how deep the water is at the water sub-samples of each cell, for the average.
+            int[] depthSum = state.depthSum();
+            // Where the estimate is close to the sea level, the exact surface is found at the middle of the cell: one exact search per
+            // cell instead of four. The estimates of the sub-samples are corrected by the difference there, see subCorrection.
+            int[] correction = state.correction();
+            boolean[] corrected = state.corrected();
+            IcebergPillars pillars = state.pillars;
+            boolean[] icebergCells = state.icebergCells();
+            // The estimates of all sub-samples first: which cells need an exact look depends on them. Each is written below.
+            int[] estimates = state.estimates;
+            for (int i = 0; i < TileData.SUB_SAMPLES; i++) {
+                WorkThrottle.checkpoint();
+                long offsetX = (long) ((i & 1) * 2 - 1) * subStep;
+                long offsetZ = (long) ((i >> 1) * 2 - 1) * subStep;
+                for (int index = 0; index < BeyondTheHorizonConstants.TILE_SAMPLE_COUNT; index++) {
+                    int x = TileGenerator.clampToWorld(baseX + (long) (index % S) * spacing + offsetX);
+                    int z = TileGenerator.clampToWorld(baseZ + (long) (index / S) * spacing + offsetZ);
+                    estimates[i * BeyondTheHorizonConstants.TILE_SAMPLE_COUNT + index] = fast.estimate(x, z);
+                }
+            }
+            if (estimateOnly) {
+                // The cell's own sample, after the sub-samples: where the exact surface is looked for, see correctNearSea.
+                int middle = TileData.SUB_SAMPLES * BeyondTheHorizonConstants.TILE_SAMPLE_COUNT;
+                for (int index = 0; index < BeyondTheHorizonConstants.TILE_SAMPLE_COUNT; index++) {
+                    int x = TileGenerator.clampToWorld(baseX + (long) (index % S) * spacing);
+                    int z = TileGenerator.clampToWorld(baseZ + (long) (index / S) * spacing);
+                    estimates[middle + index] = fast.estimate(x, z);
+                }
+            }
+            if (estimateOnly) {
+                correctNearSea(far, baseX, baseZ, spacing, estimates, correction, corrected);
+            }
+            // One sub-sample position of every cell at a time: each forms a regular grid of its own.
+            for (int i = 0; i < TileData.SUB_SAMPLES; i++) {
+                WorkThrottle.checkpoint();
+                long offsetX = (long) ((i & 1) * 2 - 1) * subStep;
+                long offsetZ = (long) ((i >> 1) * 2 - 1) * subStep;
+                if (climate != null) {
+                    climate.sampleGrid(baseX + offsetX, baseZ + offsetZ, spacing);
+                }
+                int lastError = 0;
+                int rowStartError = 0;
+                for (int index = 0; index < BeyondTheHorizonConstants.TILE_SAMPLE_COUNT; index++) {
+                    if (index % S == 0) {
+                        lastError = rowStartError;
+                    }
+                    int x = TileGenerator.clampToWorld(baseX + (long) (index % S) * spacing + offsetX);
+                    int z = TileGenerator.clampToWorld(baseZ + (long) (index / S) * spacing + offsetZ);
+                    int estimate = estimates[i * BeyondTheHorizonConstants.TILE_SAMPLE_COUNT + index];
+                    int height;
+                    if (estimateOnly) {
+                        height = estimate + subCorrection(correction, corrected, index, i);
+                        // Water or land is all that matters there: one look at the block under the sea level instead of a search.
+                        if (height < fast.seaLevel && height >= fast.seaLevel - SHALLOW_CHECK && far.solid(x, fast.seaLevel - 1, z)) {
+                            height = fast.seaLevel;
+                        }
+                    } else {
+                        // Exact near the sea level (land or water, the coast), on the grid elsewhere.
+                        int grain = far == fast || nearSea(estimate, fast.seaLevel) ? 1 : (pos.level() >= COARSER_LEVEL ? 2 * COARSE_GRAIN : COARSE_GRAIN);
+                        height = far.surface(x, z, estimate + lastError, grain);
+                        lastError = Mth.clamp(height - estimate, -MAX_HINT_ERROR, MAX_HINT_ERROR);
+                        if (index % S == 0) {
+                            rowStartError = lastError;
+                        }
+                    }
+                    if (height < fast.seaLevel) {
+                        subWater[index] |= (short) (1 << i);
+                        depthSum[index] += fast.seaLevel - height;
+                    } else {
+                        land[index]++;
+                        landSum[index] += height;
+                    }
+                    int biomeY = Mth.clamp(Math.max(height, fast.seaLevel) - 1, minY, maxY);
+                    Holder<Biome> biome = climate != null ? climate.biome(index, x, biomeY, z) : biomes.get(x, biomeY, z);
+                    subBiomes[index * TileData.SUB_SAMPLES + i] = (byte) palette.index(biome);
+                    if (height < fast.seaLevel) {
+                        int pillar = pillars.at(x, z, biome) >> 2;
+                        if (pillar > 0) {
+                            // A pillar of ice out of the frozen ocean: land after all.
+                            subWater[index] &= (short) ~(1 << i);
+                            depthSum[index] -= fast.seaLevel - height;
+                            land[index]++;
+                            landSum[index] += fast.seaLevel + pillar;
+                            icebergCells[index] = true;
+                        }
+                    }
+                }
+            }
+            for (int index = 0; index < BeyondTheHorizonConstants.TILE_SAMPLE_COUNT; index++) {
+                boolean mostlyWater = land[index] * 2 < TileData.SUB_SAMPLES;
+                heights[index] = (short) (mostlyWater ? fast.seaLevel : (int) (landSum[index] / land[index]));
+                flags[index] = (byte) ((mostlyWater ? TileData.FLAG_WATER : 0) | (icebergCells[index] ? TileData.FLAG_ICEBERG : 0));
+                int waterCount = Integer.bitCount(subWater[index] & 0xFFFF);
+                depths[index] = mostlyWater && waterCount > 0 ? depthByte(depthSum[index] / waterCount) : 0;
+                biomeIndices[index] = subBiomes[index * TileData.SUB_SAMPLES + TileData.SUB_SAMPLES - 1];
+            }
+            if (ServerPerf.ON) {
+                (estimateOnly ? ServerPerf.ROUGH_ESTIMATED : ServerPerf.ROUGH_EXACT).add(ServerPerf.cpu() - cpu);
+            }
+            return withSurface(state, palette, heights, biomeIndices, flags, depths, subBiomes, subWater, baseX, baseZ, spacing);
+        }
+
+        if (climate != null) {
+            climate.sampleGrid(baseX, baseZ, spacing);
+        }
+        boolean neighbourHint = spacing <= NEIGHBOUR_HINT_SPACING;
+        // Every other sample of this tile lies on a sample of the coarser tile around it, whose exact surface is taken over. A tile that
+        // is averaged over its cells (FILTER_LEVEL and up) has no exact surface to give.
+        TileData reuse = parent != null && pos.level() + 1 < FILTER_LEVEL && parent.subBiomes == null && parent.waterDepths != null ? parent : null;
+        int parentColumn = (pos.x() & 1) * ((S - 1) / 2);
+        int parentRow = (pos.z() & 1) * ((S - 1) / 2);
+        // Vanilla's icebergs, where they are; coarse tiles leave them out, they would only be specks.
+        // Each sample takes the highest iceberg of the cell around it, so the field reaches half a cell past the tile.
+        int cellStart = -(spacing / 2);
+        long icebergCpu = ServerPerf.cpu();
+        VanillaIcebergs.Field icebergs = VanillaIcebergs.collect(
+            level.getSeed(), minY, generator, biomes, baseX + cellStart, baseZ + cellStart, pos.size() + spacing
+        );
+        if (ServerPerf.ON) {
+            ServerPerf.ICEBERGS.add(ServerPerf.cpu() - icebergCpu);
+        }
+        IcebergPillars pillars = state.pillars;
+        int previousGround = Integer.MIN_VALUE;
+        int rowStart = Integer.MIN_VALUE;
+        int lastError = 0;
+        int rowStartError = 0;
+        for (int sz = 0; sz < S; sz++) {
+            WorkThrottle.checkpoint();
+            int blockZ = TileGenerator.clampToWorld(baseZ + (long) sz * spacing);
+            // Rows are walked in the same direction, so a new row starts next to the start of the previous one.
+            previousGround = rowStart;
+            lastError = rowStartError;
+            for (int sx = 0; sx < S; sx++) {
+                int blockX = TileGenerator.clampToWorld(baseX + (long) sx * spacing);
+                int index = sx + sz * S;
+                int groundY;
+                int taken = Integer.MIN_VALUE;
+                if (reuse != null && (sx & 1) == 0 && (sz & 1) == 0) {
+                    taken = takenGround(reuse, (parentColumn + (sx >> 1)) + (parentRow + (sz >> 1)) * S, fast.seaLevel);
+                }
+                if (taken != Integer.MIN_VALUE) {
+                    groundY = taken;
+                } else if (estimateOnly) {
+                    int estimate = fast.estimate(blockX, blockZ);
+                    groundY = nearSea(estimate, fast.seaLevel) ? search.surface(blockX, blockZ, estimate) : estimate;
+                } else if (neighbourHint && previousGround != Integer.MIN_VALUE) {
+                    groundY = search.surface(blockX, blockZ, previousGround);
+                } else {
+                    int estimate = fast.estimate(blockX, blockZ);
+                    groundY = search.surface(blockX, blockZ, estimate + lastError);
+                    lastError = Mth.clamp(groundY - estimate, -MAX_HINT_ERROR, MAX_HINT_ERROR);
+                }
+                previousGround = groundY;
+                if (sx == 0) {
+                    rowStart = groundY;
+                    rowStartError = lastError;
+                }
+                boolean water = groundY < fast.seaLevel;
+                int surfaceY = water ? fast.seaLevel : groundY;
+                int biomeY = Mth.clamp(surfaceY - 1, minY, maxY);
+                Holder<Biome> biome = climate != null ? climate.biome(index, blockX, biomeY, blockZ) : biomes.get(blockX, biomeY, blockZ);
+                biomeIndices[index] = (byte) palette.index(biome);
+                int flag = water ? TileData.FLAG_WATER : 0;
+                int highest = water && icebergs != null ? icebergs.highest(blockX + cellStart, blockZ + cellStart, spacing) : 0;
+                if (water) {
+                    int pillar = pillars.at(blockX, blockZ, biome);
+                    if (pillar >> 2 > highest >> 2) {
+                        highest = pillar;
+                    }
+                }
+                int berg = highest >> 2;
+                if (berg > 0) {
+                    surfaceY = fast.seaLevel + berg;
+                    int top = highest & 3;
+                    flag = TileData.FLAG_ICEBERG | (top == VanillaIcebergs.SNOW ? TileData.FLAG_ICEBERG_SNOW : 0)
+                        | (top == VanillaIcebergs.BLUE ? TileData.FLAG_BLUE_ICE : 0);
+                }
+                heights[index] = (short) Mth.clamp(surfaceY, Short.MIN_VALUE, Short.MAX_VALUE);
+                flags[index] = (byte) flag;
+                depths[index] = flag == TileData.FLAG_WATER ? depthByte(fast.seaLevel - groundY) : 0;
+            }
+        }
+        if (ServerPerf.ON) {
+            ServerPerf.ROUGH_NEAR.add(ServerPerf.cpu() - cpu);
+        }
+        return withSurface(state, palette, heights, biomeIndices, flags, depths, null, null, baseX, baseZ, spacing);
+    }
+
+    /**
+     * The height of the ground at a sample of a finished tile, for the same place in a finer tile; Integer.MIN_VALUE where it cannot be
+     * told (icebergs, or water deeper than the tile can say).
+     */
+    private static int takenGround(TileData tile, int index, int seaLevel) {
+        int flag = tile.flags[index];
+        if (flag == 0) {
+            return tile.heights[index];
+        }
+        if (flag == TileData.FLAG_WATER && tile.waterDepths != null) {
+            int depth = tile.waterDepths[index] & 0xFF;
+            if (depth > 0 && depth < 255) {
+                return seaLevel - depth;
+            }
+        }
+        return Integer.MIN_VALUE;
+    }
+
+    /** The tile with the blocks the surface rules put on its samples; without them when they cannot be worked out, the client then guesses. */
+    private static TileData withSurface(
+        State state, TileGenerator.Palette palette, short[] heights, byte[] biomeIndices, byte[] flags, byte[] depths,
+        byte @Nullable [] subBiomes, short @Nullable [] subWater, long baseX, long baseZ, int spacing
+    ) {
+        SurfaceBlocks.Result surface = state.surface(palette, heights, biomeIndices, flags, depths, baseX, baseZ, spacing);
+        if (surface == null) {
+            return new TileData(heights, biomeIndices, flags, palette.ids, subBiomes, subWater, depths);
+        }
+        return new TileData(heights, biomeIndices, flags, palette.ids, subBiomes, subWater, depths, surface.blocks(), surface.indices());
+    }
+
+    /** A water depth as {@link TileData#waterDepths} keeps it: at least 1 block, as 0 means none, and at most 255. */
+    private static byte depthByte(int depth) {
+        return (byte) Mth.clamp(depth, 1, 255);
+    }
+
+    /**
+     * Vanilla's pillars of ice on frozen oceans, which its surface builds from noise (MaterialSystem.frozenOceanExtension): most of
+     * the big icebergs. They depend on the position alone, so they are taken the same way here, as their height above the sea and
+     * the kind of their top (see VanillaIcebergs) in one int, height times 4 plus kind. Snow lies on the tops of the tall ones;
+     * vanilla draws its exact depth from a random of the column, this takes its middle.
+     */
+    private static final class IcebergPillars {
+        private final Noise surface;
+        private final Noise pillar;
+        private final Noise roof;
+        private final int seaLevel;
+        private final BlockPos.MutableBlockPos scratch = new BlockPos.MutableBlockPos();
+
+        IcebergPillars(RandomState randomState, int seaLevel) {
+            this.surface = randomState.getOrCreateNoise(Noises.ICEBERG_SURFACE);
+            this.pillar = randomState.getOrCreateNoise(Noises.ICEBERG_PILLAR);
+            this.roof = randomState.getOrCreateNoise(Noises.ICEBERG_PILLAR_ROOF);
+            this.seaLevel = seaLevel;
+        }
+
+        int at(int x, int z, Holder<Biome> biome) {
+            if (!biome.is(Biomes.FROZEN_OCEAN) && !biome.is(Biomes.DEEP_FROZEN_OCEAN)) {
+                return 0;
+            }
+            double iceberg = Math.min(Math.abs(this.surface.get(x, 0.0, z) * 8.25), this.pillar.get(x * 1.28, 0.0, z * 1.28) * 15.0F);
+            if (iceberg <= 1.8) {
+                return 0;
+            }
+            double roofHeight = Math.abs(this.roof.get(x * 1.17, 0.0, z * 1.17) * 1.5);
+            double top = Math.min(iceberg * iceberg * 1.2, Math.ceil(roofHeight * 40.0) + 14.0);
+            if (biome.value().shouldMeltFrozenOceanIcebergSlightly(this.scratch.set(x, this.seaLevel, z), this.seaLevel)) {
+                top -= 2.0;
+            }
+            if (top <= 2.0) {
+                return 0;
+            }
+            int height = (int) (top + this.seaLevel) - this.seaLevel;
+            if (height <= 0) {
+                return 0;
+            }
+            boolean snow = this.seaLevel + height - 1 > this.seaLevel + PILLAR_SNOW_ABOVE;
+            return height * 4 + (snow ? VanillaIcebergs.SNOW : VanillaIcebergs.PACKED);
+        }
+    }
+
+    /** Pillar tops higher than this over the sea have snow, the middle of vanilla's 18 to 27. */
+    private static final int PILLAR_SNOW_ABOVE = 22;
+
+    /**
+     * Where the estimate is close to the sea level, the exact surface is found at the middle of the cell: the difference corrects the
+     * estimates of its sub-samples, see subCorrection. A cell next to one near the sea level can reach it with its sub-samples, so it
+     * is checked too. Samples on the tile edges only look at themselves: the next tile shares them and must find the same.
+     */
+    private static void correctNearSea(
+        DensitySurface fast, long baseX, long baseZ, int spacing, int[] estimates, int[] correction, boolean[] corrected
+    ) {
+        int count = BeyondTheHorizonConstants.TILE_SAMPLE_COUNT;
+        // The estimates of the cells' own samples come after those of the sub-samples.
+        int middle = TileData.SUB_SAMPLES * count;
+        for (int index = 0; index < count; index++) {
+            int sx = index % S;
+            int sz = index / S;
+            boolean check = nearSea(estimates[middle + index], fast.seaLevel);
+            if (!isEdge(sx, sz)) {
+                for (int nz = sz - 1; nz <= sz + 1 && !check; nz++) {
+                    for (int nx = sx - 1; nx <= sx + 1; nx++) {
+                        if (nearSea(estimates[middle + nx + nz * S], fast.seaLevel)) {
+                            check = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (!check) {
+                continue;
+            }
+            if (sx == 0) {
+                WorkThrottle.checkpoint();
+            }
+            int x = TileGenerator.clampToWorld(baseX + (long) sx * spacing);
+            int z = TileGenerator.clampToWorld(baseZ + (long) sz * spacing);
+            int estimate = estimates[middle + index];
+            correction[index] = fast.surface(x, z, estimate) - estimate;
+            corrected[index] = true;
+        }
+    }
+
+    /**
+     * What generating tiles needs that stays the same from tile to tile, kept per generator thread instead of made for every tile: the
+     * samplers of the generator's density functions with their cache, the climate grid and its buffers, and the arrays of the far
+     * tiles that do not leave the generator. It belongs to one generator of one world; another one makes a new state.
+     */
+    private static final class State {
+        private static final ThreadLocal<@Nullable State> CURRENT = new ThreadLocal<>();
+
+        final ChunkGenerator generator;
+        final RandomState randomState;
+        final int minY;
+        final int maxY;
+        final @Nullable DensitySurface fast;
+        /**
+         * The surface of far tiles: the generator's terrain without its caves (vanilla's sloped cheese, which the final density
+         * takes the caves out of). Near the sea level the two only differ where a cave breaks through the surface, which far tiles,
+         * 32 blocks and more between samples, cannot show anyway; the caves are most of the work of the final density. Without such a
+         * function (other world presets) it is the final density.
+         */
+        final @Nullable DensitySurface far;
+        final @Nullable ClimateGrid climate;
+        final @Nullable IcebergPillars pillars;
+        /** The surface rules of the generator for the blocks on top of the samples, null where they cannot be run, see {@link SurfaceBlocks}. */
+        private @Nullable SurfaceBlocks surfaceBlocks;
+        private boolean surfaceFailed;
+        private final int[] land = new int[BeyondTheHorizonConstants.TILE_SAMPLE_COUNT];
+        private final long[] landSum = new long[BeyondTheHorizonConstants.TILE_SAMPLE_COUNT];
+        private final int[] depthSum = new int[BeyondTheHorizonConstants.TILE_SAMPLE_COUNT];
+        private final int[] correction = new int[BeyondTheHorizonConstants.TILE_SAMPLE_COUNT];
+        private final boolean[] corrected = new boolean[BeyondTheHorizonConstants.TILE_SAMPLE_COUNT];
+        private final boolean[] icebergCells = new boolean[BeyondTheHorizonConstants.TILE_SAMPLE_COUNT];
+        /** The estimates of the sub-samples, then (when the estimates alone are used) those of the cells' own samples. */
+        final int[] estimates = new int[BeyondTheHorizonConstants.TILE_SAMPLE_COUNT * (TileData.SUB_SAMPLES + 1)];
+
+        private State(ServerLevel level, ChunkGenerator generator, RandomState randomState, int minY, int maxY) {
+            this.generator = generator;
+            this.randomState = randomState;
+            this.minY = minY;
+            this.maxY = maxY;
+            // Buffers come from pools of this state, which only its thread uses: without one, vanilla makes new buffers for every
+            // value sampled, the most garbage the rough tiles make.
+            SamplerContext context = SamplerContext.builder().enableCaches().useBufferArena(new DensityBufferPool(20)).build();
+            if (generator instanceof NoiseBasedChunkGenerator noise) {
+                NoiseRouter router = noise.generatorSettings().value().noiseRouter();
+                this.fast = new DensitySurface(noise, randomState, minY, maxY, context, router.finalDensity());
+                DensityFunction terrain = terrainWithoutCaves(router.finalDensity());
+                // A context of its own: its caches are those of another sampler.
+                DensitySurface far = terrain != null
+                    ? new DensitySurface(noise, randomState, minY, maxY, SamplerContext.builder().enableCaches().useBufferArena(new DensityBufferPool(20)).build(), terrain)
+                    : this.fast;
+                if (terrain != null && !terrainMatches(far, this.fast)) {
+                    // A worldgen pack can give another shape the name of the terrain without caves; far tiles then fall back
+                    // to the final density: slower, never the wrong surface. Warned once per run and not only in debug builds:
+                    // a wrong surface would be silent otherwise.
+                    if (TERRAIN_REJECTED.compareAndSet(false, true)) {
+                        LOGGER.warn("[FarPlane terrain] the density function named like sloped cheese is not the terrain without caves; far tiles use the final density");
+                    }
+                    far = this.fast;
+                }
+                if (ServerPerf.ON) {
+                    LOGGER.info("[FarPlane terrain] far tiles look for the surface in {}", far != this.fast ? terrain : "the final density");
+                }
+                this.far = far;
+                this.climate = ClimateGrid.supported(router) ? new ClimateGrid(generator, router, randomState, context) : null;
+                this.pillars = new IcebergPillars(randomState, this.fast.seaLevel);
+                try {
+                    this.surfaceBlocks = SurfaceBlocks.create(level, noise, randomState, minY);
+                } catch (RuntimeException | LinkageError e) {
+                    // The tiles go without block colors; warned once per generator thread and not only in debug builds, as the
+                    // far terrain would silently fall back to guessed colors.
+                    this.surfaceFailed = true;
+                    LOGGER.warn("[FarPlane terrain] the surface rules could not be set up, distant terrain colors are guessed from the biome", e);
+                }
+            } else {
+                this.fast = null;
+                this.far = null;
+                this.climate = null;
+                this.pillars = null;
+            }
+        }
+
+        static State of(ServerLevel level, ChunkGenerator generator, RandomState randomState, int minY, int maxY) {
+            State state = CURRENT.get();
+            if (state == null || state.generator != generator || state.randomState != randomState || state.minY != minY || state.maxY != maxY) {
+                state = new State(level, generator, randomState, minY, maxY);
+                CURRENT.set(state);
+            }
+            return state;
+        }
+
+        /** The surface blocks of a tile's samples, or null when the rules fail (then they are not tried again on this thread). */
+        SurfaceBlocks.@Nullable Result surface(
+            TileGenerator.Palette palette, short[] heights, byte[] biomes, byte[] flags, byte[] depths, long baseX, long baseZ, int spacing
+        ) {
+            SurfaceBlocks blocks = this.surfaceBlocks;
+            if (blocks == null) {
+                return null;
+            }
+            try {
+                return blocks.compute(palette, heights, biomes, flags, depths, baseX, baseZ, spacing);
+            } catch (RuntimeException | LinkageError e) {
+                if (!this.surfaceFailed) {
+                    this.surfaceFailed = true;
+                    LOGGER.warn("[FarPlane terrain] working out the surface blocks failed, distant terrain colors are guessed from the biome", e);
+                }
+                this.surfaceBlocks = null;
+                return null;
+            }
+        }
+
+        int[] land() {
+            java.util.Arrays.fill(this.land, 0);
+            return this.land;
+        }
+
+        int[] depthSum() {
+            java.util.Arrays.fill(this.depthSum, 0);
+            return this.depthSum;
+        }
+
+        long[] landSum() {
+            java.util.Arrays.fill(this.landSum, 0L);
+            return this.landSum;
+        }
+
+        int[] correction() {
+            java.util.Arrays.fill(this.correction, 0);
+            return this.correction;
+        }
+
+        boolean[] corrected() {
+            java.util.Arrays.fill(this.corrected, false);
+            return this.corrected;
+        }
+
+        boolean[] icebergCells() {
+            java.util.Arrays.fill(this.icebergCells, false);
+            return this.icebergCells;
+        }
+
+        /** The named terrain without caves inside the final density, see {@link #far}; null when there is none. */
+        private static @Nullable DensityFunction terrainWithoutCaves(DensityFunction finalDensity) {
+            DensityFunction[] found = new DensityFunction[1];
+            DfRewriteRule finder = new DfRewriteRule() {
+                @Override
+                public DensityFunction rewrite(DensityFunction function) {
+                    if (found[0] != null) {
+                        return function;
+                    }
+                    if (function instanceof DensityFunctions.HolderHolder holder && holder.function().unwrapKey()
+                        .map(key -> key.identifier().getPath().endsWith(TERRAIN_WITHOUT_CAVES)).orElse(false)) {
+                        found[0] = function;
+                        return function;
+                    }
+                    function.rewriteChildren(this);
+                    return function;
+                }
+            };
+            try {
+                finder.rewrite(finalDensity);
+            } catch (RuntimeException e) {
+                return null;
+            }
+            return found[0];
+        }
+
+        /**
+         * Whether a candidate really is the terrain without caves, probed against the final density at spread columns. Caves
+         * only carve down, so it is never under the real surface, beyond the few blocks structure terrain adaptation can add
+         * to the real one; and it is far above the real surface only where caves break through, which is not everywhere.
+         */
+        private static boolean terrainMatches(DensitySurface candidate, DensitySurface fast) {
+            int[][] probes = {{0, 0}, {1531, -977}, {-2048, 511}, {977, 2047}, {-511, -1531}, {3071, 1531}, {-3071, -2047}, {511, -3071}};
+            int tooHigh = 0;
+            for (int[] probe : probes) {
+                int hint = fast.estimate(probe[0], probe[1]);
+                int real = fast.surface(probe[0], probe[1], hint);
+                int found = candidate.surface(probe[0], probe[1], hint);
+                if (found < real - 4) {
+                    return false;
+                }
+                if (found > real + 32) {
+                    tooHigh++;
+                }
+            }
+            return tooHigh < 3;
+        }
+
+        /** Set when a named terrain without caves was rejected, so the warning is written once. */
+        private static final java.util.concurrent.atomic.AtomicBoolean TERRAIN_REJECTED = new java.util.concurrent.atomic.AtomicBoolean();
+        private static final String TERRAIN_WITHOUT_CAVES = "/sloped_cheese";
+    }
+
+    private static boolean isEdge(int sx, int sz) {
+        return sx == 0 || sz == 0 || sx == S - 1 || sz == S - 1;
+    }
+
+    /**
+     * The correction of the estimate at sub-sample {@code i} of a cell: blended from the corrections at the middle of the cells it lies
+     * between, by how far it lies towards them (a quarter of a cell), as the error of the estimate changes over a cell on rugged
+     * ground. Cells without a correction count with the cell's own. Samples on tile edges keep their own correction, see generate.
+     */
+    private static int subCorrection(int[] correction, boolean[] corrected, int index, int i) {
+        int sx = index % S;
+        int sz = index / S;
+        int own = correction[index];
+        if (isEdge(sx, sz)) {
+            return own;
+        }
+        int dx = (i & 1) * 2 - 1;
+        int dz = (i >> 1) * 2 - 1;
+        float wx = 0.25F;
+        float wz = 0.25F;
+        int across = index + dx;
+        int down = index + dz * S;
+        int diagonal = index + dx + dz * S;
+        float blended = (1.0F - wx) * (1.0F - wz) * own
+            + wx * (1.0F - wz) * (corrected[across] ? correction[across] : own)
+            + (1.0F - wx) * wz * (corrected[down] ? correction[down] : own)
+            + wx * wz * (corrected[diagonal] ? correction[diagonal] : own);
+        return Math.round(blended);
+    }
+
+    /** Generators without density functions: whole noise columns, the top block and its fluid. */
+    private static void exactColumns(
+        ServerLevel level, TilePos pos, ChunkGenerator generator, RandomState randomState, TileGenerator.BiomeLookup biomes, short[] heights,
+        byte[] biomeIndices, byte[] flags, byte[] depths, TileGenerator.Palette palette
+    ) {
+        int minY = level.getMinY();
+        int maxY = level.getMaxY();
+        int spacing = 1 << pos.level();
+        for (int index = 0; index < BeyondTheHorizonConstants.TILE_SAMPLE_COUNT; index++) {
+            if (index % S == 0) {
+                WorkThrottle.checkpoint();
+            }
+            int blockX = TileGenerator.clampToWorld(pos.minX() + (long) (index % S) * spacing);
+            int blockZ = TileGenerator.clampToWorld(pos.minZ() + (long) (index / S) * spacing);
+            NoiseColumn column = generator.getBaseColumn(blockX, blockZ, level, randomState);
+            int surfaceY = minY;
+            int flag = 0;
+            for (int y = maxY; y >= minY; y--) {
+                BlockState state = column.getBlock(y);
+                if (state.isAir()) {
+                    continue;
+                }
+                surfaceY = y + 1;
+                if (state.is(Blocks.WATER)) {
+                    flag = TileData.FLAG_WATER;
+                    int ground = y;
+                    while (ground > minY && column.getBlock(ground).is(Blocks.WATER)) {
+                        ground--;
+                    }
+                    depths[index] = depthByte(surfaceY - ground - 1);
+                } else if (state.is(Blocks.LAVA)) {
+                    flag = TileData.FLAG_LAVA;
+                }
+                break;
+            }
+            heights[index] = (short) Mth.clamp(surfaceY, Short.MIN_VALUE, Short.MAX_VALUE);
+            flags[index] = (byte) flag;
+            biomeIndices[index] = (byte) palette.index(biomes.get(blockX, Mth.clamp(surfaceY - 1, minY, maxY), blockZ));
+        }
+    }
+
+    /** Whether a square of samples lies inside the world, where no sample is moved onto the border. */
+    private static boolean insideWorld(long minX, long minZ, long size) {
+        return minX >= -BeyondTheHorizonConstants.WORLD_LIMIT && minZ >= -BeyondTheHorizonConstants.WORLD_LIMIT
+            && minX + size <= BeyondTheHorizonConstants.WORLD_LIMIT && minZ + size <= BeyondTheHorizonConstants.WORLD_LIMIT;
+    }
+
+    private static DensityVolume grid(long minX, long minZ, int spacing) {
+        return new DensityVolume(S, 1, S, (int) minX, 0, (int) minZ, spacing, 1, spacing);
+    }
+
+    /**
+     * The climate behind the biomes on a grid of samples. Climate values that do not depend on the height are read from the grid; the
+     * rest (depth, which picks cave biomes under the surface) is sampled at each point, which reuses the cached grid for its flat parts.
+     */
+    private static final class ClimateGrid {
+        private final Climate.Sampler sampler;
+        private final DensitySampler.Bound[] parameters;
+        private final boolean[] flat = new boolean[6];
+        private final DensityBuffer[] buffers = new DensityBuffer[6];
+        private final @Nullable MultiNoiseBiomeSource multiNoise;
+        private final BiomeResolver resolver;
+
+        ClimateGrid(ChunkGenerator generator, NoiseRouter router, RandomState randomState, SamplerContext context) {
+            this.sampler = randomState.createClimateSampler(context);
+            this.parameters = new DensitySampler.Bound[] {
+                this.sampler.temperature(), this.sampler.humidity(), this.sampler.continentalness(), this.sampler.erosion(), this.sampler.depth(),
+                this.sampler.weirdness()
+            };
+            DensityFunction[] functions = {router.temperature(), router.vegetation(), router.continents(), router.erosion(), router.depth(), router.ridges()};
+            for (int i = 0; i < 6; i++) {
+                this.flat[i] = (functions[i].domainAxes() & DensityFunction.AXIS_Y) == 0;
+                this.buffers[i] = DensityBuffer.createUnpooled(BeyondTheHorizonConstants.TILE_SAMPLE_COUNT);
+            }
+            BiomeSource source = generator.getBiomeSource();
+            this.multiNoise = source instanceof MultiNoiseBiomeSource multi ? multi : null;
+            this.resolver = source.createResolver(this.sampler);
+        }
+
+        /**
+         * Whether the climate can be sampled on a grid: vanilla's climate is plain noise and splines. Interpolated noise in it (from
+         * a data pack) would be sampled on its full cell grid, see the class comment.
+         */
+        static boolean supported(NoiseRouter router) {
+            boolean[] interpolated = new boolean[1];
+            DfRewriteRule finder = new DfRewriteRule() {
+                @Override
+                public DensityFunction rewrite(DensityFunction function) {
+                    if (function instanceof InterpolatedFunction) {
+                        interpolated[0] = true;
+                    } else if (!interpolated[0]) {
+                        function.rewriteChildren(this);
+                    }
+                    return function;
+                }
+            };
+            for (DensityFunction function : new DensityFunction[] {
+                router.temperature(), router.vegetation(), router.continents(), router.erosion(), router.depth(), router.ridges()
+            }) {
+                finder.rewrite(function);
+            }
+            return !interpolated[0];
+        }
+
+        /** Samples every parameter on the grid; the ones that depend on height only so their flat parts land in the cache. */
+        void sampleGrid(long minX, long minZ, int spacing) {
+            DensityVolume volume = grid(minX, minZ, spacing);
+            for (int i = 0; i < 6; i++) {
+                this.parameters[i].sampleVolume(this.buffers[i], volume);
+            }
+        }
+
+        /** The biome at a sample of the last grid, at the given height. */
+        Holder<Biome> biome(int index, int x, int y, int z) {
+            if (this.multiNoise == null) {
+                return this.resolver.getNoiseBiome(QuartPos.fromBlock(x), QuartPos.fromBlock(y), QuartPos.fromBlock(z));
+            }
+            int blockY = QuartPos.toBlock(QuartPos.fromBlock(y));
+            return this.multiNoise.getNoiseBiome(Climate.target(
+                this.value(0, index, x, blockY, z), this.value(1, index, x, blockY, z), this.value(2, index, x, blockY, z),
+                this.value(3, index, x, blockY, z), this.value(4, index, x, blockY, z), this.value(5, index, x, blockY, z)
+            ));
+        }
+
+        private float value(int parameter, int index, int x, int y, int z) {
+            return this.flat[parameter] ? this.buffers[parameter].get(index) : this.parameters[parameter].sampleValue(x, y, z);
+        }
+    }
+
+    /**
+     * Finds the terrain surface by sampling the generator's final density at single points instead of building a whole noise column.
+     * The search starts next to the neighbouring sample's height, so it usually needs only a handful of samples. Density above zero
+     * means solid. Aquifers are skipped: anything below sea level counts as ocean.
+     */
+    static final class DensitySurface {
+        private static final int STEP = 8;
+        /** Most blocks the first probe of a search jumps by (what the density and the slope ask for). */
+        private static final int MAX_JUMP = 64;
+
+        /** The density change per block at the surface, learned from the searches so far (this object belongs to one thread); 0 until known. */
+        private float slope;
+
+        private final DensitySampler sampler;
+        private final DensitySampler surfaceEstimate;
+        private final SamplerContext context;
+        final NoiseRouter router;
+        private final int minY;
+        private final int maxY;
+        final int seaLevel;
+
+        /** @param density where it is above zero is solid: the final density, or for far tiles the terrain without caves */
+        DensitySurface(
+            NoiseBasedChunkGenerator generator, RandomState randomState, int levelMinY, int levelMaxY, SamplerContext context, DensityFunction density
+        ) {
+            NoiseGeneratorSettings settings = generator.generatorSettings().value();
+            this.sampler = randomState.getSampler(density);
+            this.surfaceEstimate = randomState.getSampler(settings.noiseRouter().chunkSurfaceLevel());
+            this.context = context;
+            this.router = settings.noiseRouter();
+            this.minY = Math.max(levelMinY, settings.noiseSettings().minY());
+            this.maxY = Math.min(levelMaxY, settings.noiseSettings().minY() + settings.noiseSettings().height() - 1);
+            this.seaLevel = settings.seaLevel();
+        }
+
+        /** Cheap 2D guess of the surface height without caves, overhangs and jagged peaks. */
+        int estimate(int x, int z) {
+            return this.toHeight(this.surfaceEstimate.sampleValue(this.context, x, 0, z));
+        }
+
+        private int toHeight(float value) {
+            return Float.isFinite(value) ? Mth.clamp(Mth.floor(value), this.minY, this.maxY + 1) : this.seaLevel;
+        }
+
+        /** Checks the estimate against the exact surface at a few points of a tile. Custom world presets may not provide a usable one. */
+        boolean estimateMatches(long baseX, long baseZ, int size) {
+            int totalError = 0;
+            int maxError = 0;
+            int samples = 0;
+            for (int i = 0; i < 5; i++) {
+                long offsetX = i == 4 ? size / 2 : (i & 1) * (long) size;
+                long offsetZ = i == 4 ? size / 2 : (i >> 1) * (long) size;
+                int x = TileGenerator.clampToWorld(baseX + offsetX);
+                int z = TileGenerator.clampToWorld(baseZ + offsetZ);
+                int estimate = this.estimate(x, z);
+                int error = Math.abs(this.surface(x, z, estimate) - estimate);
+                totalError += error;
+                maxError = Math.max(maxError, error);
+                samples++;
+            }
+            // One badly estimated probe means the estimate goes badly wrong somewhere on the tile, even when the others are right.
+            return totalError <= MAX_ESTIMATE_ERROR * samples && maxError <= MAX_PROBE_ERROR;
+        }
+
+        private boolean solid(int x, int y, int z) {
+            return this.sampler.sampleValue(this.context, x, y, z) > 0.0F;
+        }
+
+        /**
+         * Returns the y just above the highest solid block, searching from {@code hint}: steps that double in size until the surface
+         * is passed, then bisection. A close hint takes about five samples, a hint hundreds of blocks off still only a dozen.
+         */
+        int surface(int x, int z, int hint) {
+            return this.surface(x, z, hint, 1);
+        }
+
+        /**
+         * As {@link #surface(int, int, int)}, but with {@code grain} above 1 the height is found on a fixed grid of that many blocks (the
+         * middle of the grid cell the surface lies in) instead of to the block: the search runs on grid points, which saves
+         * log2(grain) density samples per search and gives the same height for the same place whatever the hint was (as long as the
+         * density is solid below the surface and open above, which the terrain without caves is).
+         *
+         * The density value, not only its sign, is used: the first probe jumps by (density / slope) blocks, with the slope (density
+         * change per block at the surface) learned from the searches before, and the bracket is closed by interpolation between its
+         * ends (regula falsi, with a bisection after two steps on the same side so it cannot crawl). Same bracket as the plain
+         * bisection, so a result is as right as before; it needs fewer samples where the density is smooth, which it is near the surface.
+         */
+        int surface(int x, int z, int hint, int grain) {
+            if (ServerPerf.ON) {
+                ServerPerf.SURFACE_SEARCHES.incrementAndGet();
+            }
+            if (this.maxY < this.minY) {
+                return this.minY;
+            }
+            int guess = Mth.clamp(hint, this.minY, this.maxY);
+            float first = this.density(x, guess, z);
+            int solidY = guess;
+            int airY = guess;
+            float solidD = first;
+            float airD = first;
+            int step = STEP;
+            // How far the first probe goes: by what the density says when the slope is known, else the plain first step.
+            int jump = this.slope > 0.0F ? Mth.clamp(Math.round(Math.abs(first) / this.slope) + 1, 1, MAX_JUMP) : 0;
+            if (first > 0.0F) {
+                while (true) {
+                    if (solidY >= this.maxY) {
+                        return this.maxY + 1;
+                    }
+                    int used = jump > 0 ? jump : step;
+                    int probe = Math.min(solidY + used, this.maxY);
+                    float d = this.density(x, probe, z);
+                    if (d <= 0.0F) {
+                        airY = probe;
+                        airD = d;
+                        break;
+                    }
+                    solidY = probe;
+                    solidD = d;
+                    step = Math.max(step, used) << 1;
+                    jump = 0;
+                }
+            } else {
+                while (true) {
+                    if (airY <= this.minY) {
+                        return this.minY;
+                    }
+                    int used = jump > 0 ? jump : step;
+                    int probe = Math.max(airY - used, this.minY);
+                    float d = this.density(x, probe, z);
+                    if (d > 0.0F) {
+                        solidY = probe;
+                        solidD = d;
+                        break;
+                    }
+                    airY = probe;
+                    airD = d;
+                    step = Math.max(step, used) << 1;
+                    jump = 0;
+                }
+            }
+            boolean grid = grain > 1 && this.minY % grain == 0;
+            // The bracket in grid points (lo at or under the solid ground, hi at or over the air) or, without a grid, in blocks.
+            int lo = grid ? Math.floorDiv(solidY, grain) : solidY;
+            int hi = grid ? Math.floorDiv(airY + grain - 1, grain) : airY;
+            int unit = grid ? grain : 1;
+            // The places and densities last sampled on each side: what the interpolation reads.
+            int loY = solidY;
+            int hiY = airY;
+            float loD = solidD;
+            float hiD = airD;
+            int lastSide = 0;
+            int repeats = 0;
+            while (hi - lo > 1) {
+                int middle;
+                if (repeats >= 2 || !(loD > hiD)) {
+                    middle = (lo + hi) >> 1;
+                } else {
+                    float cross = loY + loD / (loD - hiD) * (hiY - loY);
+                    middle = Mth.clamp(Math.round(cross / unit), lo + 1, hi - 1);
+                }
+                int at = Math.min(middle * unit, this.maxY);
+                float d = this.density(x, at, z);
+                int side;
+                if (d > 0.0F) {
+                    lo = middle;
+                    loY = at;
+                    loD = d;
+                    side = 1;
+                } else {
+                    hi = middle;
+                    hiY = at;
+                    hiD = d;
+                    side = -1;
+                }
+                repeats = side == lastSide ? repeats + 1 : 0;
+                lastSide = side;
+            }
+            // Learn the slope from the bracket the search ended with: the density change per block right at the surface.
+            if (hiY > loY && hiY - loY <= 2 * unit && loD > hiD) {
+                float local = (loD - hiD) / (hiY - loY);
+                if (Float.isFinite(local) && local > 1.0E-6F) {
+                    this.slope = this.slope > 0.0F ? 0.5F * this.slope + 0.5F * local : local;
+                }
+            }
+            if (grid) {
+                return Mth.clamp(hi * grain - (grain >> 1), this.minY, this.maxY + 1);
+            }
+            return Mth.clamp(lo + 1, this.minY, this.maxY + 1);
+        }
+
+        private float density(int x, int y, int z) {
+            if (ServerPerf.ON) {
+                ServerPerf.SURFACE_SAMPLES.incrementAndGet();
+            }
+            return this.sampler.sampleValue(this.context, x, y, z);
+        }
+    }
+}
