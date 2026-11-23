@@ -4,7 +4,10 @@ See your terrain well... beyond your terrain with a performance cost that depend
 
 > **Alpha:** expect bugs and issues
 > 
-> Performance cost depends on your system *(about 26% on an Intel HD 4600 at 16 render distance, 64 LOD distance, 2 finest tiles and 4 blocks stepped terrain — 170 fps off vs 125 fps on)*
+> Performance cost depends on your system
+> * *On an i5 4590 with an Intel HD 4600 at 64 LOD distance, 2.0 sharpness, 2 finest tiles, 4x4 pixelated filter and Trees on (174 fps off vs 123 fps on, 92 fps with Block Heightmap on at 32 chunks)*
+> * *628 fps off vs 408 fps on at 512 LOD distance, 3.0 sharpness and 2 finest tiles (tested by Aadiel on an i7 9700 and an RTX 2060 Super)*
+> * *With shader packs 135 fps off vs 123 fps on (tested by Aadiel)*
 
 ---
 
@@ -17,11 +20,14 @@ See your terrain well... beyond your terrain with a performance cost that depend
 
 ## What it has now/Features done
 
-* [x] Heightmap terrain up to 10k chunks for now, built by the server using vanilla's noisemap,   
-* [x] Stepped heightmap terrain, which performs better than the old block-level detail
+* [x] Heightmap LOD up to 10k chunks for now, built by the server using vanilla's noisemap
+* [x] Block Heightmap, which performs better than the old block-level detail
+* [x] Faster Heightmap generation
+* [x] Better block heightmap detail
 * [x] The distant terrain is saved in a cache, so rejoining makes the LOD load fast
 * [x] Optional pixelated filter for a pixel-art look
 * [x] Optional approximated trees per biome *(being worked on)*
+* [x] Shader pack support *(see below)*
 * [x] Client and server side settings *(note to change server side settings you have to join a world)*
 * since it uses vanilla's noisemap it works with worldgen datapacks like terralith and tectonic
 
@@ -29,11 +35,9 @@ See your terrain well... beyond your terrain with a performance cost that depend
 
 ## Roadmap
 
-* [x] Faster Heightmap generation
-* [x] Better stepped terrain detail
-* [x] Terrain colors need to be reworked to be a little more accurate
-* [x] Shader pack support "*Only internal developement versions will be available soon*"
-* [ ] Faster Stepped Heightmap generation
+* [ ] Fix trees not showing up in the LOD with shader packs
+* [ ] Better block color accuracy
+* [ ] Faster Block Heightmap generation
 * [ ] Block textures in the LOD
 * [ ] Cave generation
 * [ ] Trees that match the real tree placement
@@ -41,9 +45,21 @@ See your terrain well... beyond your terrain with a performance cost that depend
 
 ---
 
+## Shader packs
+
+Works with Iris shader packs, Sodium and Iris are not required
+
+* Tested by Aadiel: Nostalgia, Photon, Solas, Iteration and Rethinking Voxels
+* Tested by me: SuperDuperVanilla, Complementary and Vanilla Plus, but the fps was bad because I have an iGPU
+* Trees do not show up in the LOD with shader packs *(not fixed yet)*
+* The pixelated filter doesn't work with shader packs
+* Bliss still has artifacts
+
+---
+
 ## Block details
 
-Stepped terrain replaces block details and it performs better, and I'm going to keep working on it until it matches that level of detail
+Block Heightmap replaces block details and it performs better, and I'm going to keep working on it until it matches that level of detail
 > <sub>Get it?.. Level of Detail... LOD.... oh never mind</sub>
 
 ---
@@ -56,7 +72,7 @@ The mod also has to be installed on the server for the distant terrain to show o
 
 ## Limitations
 
-* The distant and stepped terrain and is heightmap based, so there are no structures or caves yet *(being worked on)*
+* The distant terrain is heightmap based, so there are no caves yet *(being worked on)*
 * Trees are approximated and don’t use the placement of the actual trees in the world *(being worked on)*
 
 ---
