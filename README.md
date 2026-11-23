@@ -1,3 +1,6 @@
+# Mod is only available in curseforge and soon in modrinth
+https://www.curseforge.com/minecraft/mc-mods/beyond-the-terrain
+
 # Beyond the Terrain
 
 See your terrain well... beyond your terrain with a performance cost that depends on your system
