@@ -1,5 +1,5 @@
-# Mod is only available in curseforge and soon in modrinth
-https://www.curseforge.com/minecraft/mc-mods/beyond-the-terrain
+# Mod is only available in Curseforge and In Modrinth soon
+* https://www.curseforge.com/minecraft/mc-mods/beyond-the-terrain
 
 # Beyond the Terrain
 
