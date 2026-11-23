@@ -50,6 +50,8 @@ final class ServerPerf {
     static final Kind ICEBERGS = new Kind("cpu icebergs");
     /** Exact searches for the surface, the costly part of rough tiles. */
     static final AtomicLong SURFACE_SEARCHES = new AtomicLong();
+    /** Density samples the surface searches took (the cost of a search is these, not the searches). */
+    static final AtomicLong SURFACE_SAMPLES = new AtomicLong();
     /** Columns of chunk summaries scanned and the time it took, see {@link ChunkSummary}. */
     static final AtomicLong SCAN_COLUMNS = new AtomicLong();
     static final AtomicLong SCAN_NANOS = new AtomicLong();
@@ -129,7 +131,7 @@ final class ServerPerf {
         for (Kind kind : new Kind[] {ROUGH, ROUGH_CPU, ROUGH_PAUSED, ROUGH_RETURN, ROUGH_NEAR, ROUGH_ESTIMATED, ROUGH_EXACT, ICEBERGS, DETAIL, DETAIL_LIVE, DETAIL_SAVED, DETAIL_VIRTUAL, DETAIL_PREPARE, DETAIL_COLLECT, DETAIL_TRIM, DETAIL_BUILD, DETAIL_ENCODE, DETAIL_CPU, DETAIL_PAUSED, SAVED_CHUNKS, VIRTUAL_REGIONS}) {
             any |= kind.append(line);
         }
-        line.append(" | surface searches ").append(SURFACE_SEARCHES.getAndSet(0L));
+        line.append(" | surface searches ").append(SURFACE_SEARCHES.getAndSet(0L)).append(" (").append(SURFACE_SAMPLES.getAndSet(0L)).append(" samples)");
         long columns = SCAN_COLUMNS.getAndSet(0L);
         long scanNanos = SCAN_NANOS.getAndSet(0L);
         if (columns > 0L) {

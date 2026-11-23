@@ -98,11 +98,6 @@ public final class VertexArena implements AutoCloseable {
         return part;
     }
 
-    /** For the debug screen: blocks and the share of them free. */
-    public String stats() {
-        return this.blocks.size() + " blocks " + ((long) this.blocks.size() * this.blockBytes >> 20) + " MB, free " + (this.free >> 20) + " MB";
-    }
-
     @Override
     public void close() {
         for (Block block : this.blocks) {

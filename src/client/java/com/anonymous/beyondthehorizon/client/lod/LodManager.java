@@ -20,9 +20,13 @@ import java.util.HashSet;
 import java.util.Set;
 import java.util.List;
 import java.util.Map;
+import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
 import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.client.Minecraft;
@@ -48,16 +52,26 @@ public final class LodManager {
     private static final double FAST_MOVEMENT = 12.0;
     private static final Logger LOGGER = LoggerFactory.getLogger("Beyond the Terrain");
     private static final int ARENA_BLOCK_BYTES = 8 * 1024 * 1024;
-    /** Tiles asked for and not yet here. Few, so the server's queue stays short and what it works on is what is needed now. */
-    private static final int MAX_PENDING = 24;
+    /**
+     * Tiles asked for and not yet here (a tile counts until its mesh is uploaded). 24 left the server's threads idle while the cheap coarse
+     * tiles were loaded (log of 2026-11-22: 11-42 % busy, 1000 tiles not asked yet); the server still works nearest-first from its own queue.
+     */
+    private static final int MAX_PENDING = 64;
     /** Chunks at the edge of what vanilla has loaded that are not counted as vanilla's, see {@link #tick}. */
     private static final int OWNED_MARGIN = 2;
+    /** The Block Heightmap's finest tiles (one column per block) reach this far from the camera, or its distance if that is less. */
+    private static final double BLOCK_FINE_BLOCKS = 128.0;
     /** Tiles being read from disk and built at once. */
-    private static final int MAX_LOCAL_PENDING = 96;
+    private static final int MAX_LOCAL_PENDING = 192;
     /** Long, since a tile can wait behind others while the server generates; asking again early only fills its queue with copies. */
     private static final int REQUEST_TIMEOUT_MS = 120_000;
     private static final long UPLOAD_NS = 2_500_000L;
+    /** Upload budget per frame while many built tiles wait: at ~9 fps 2.5 ms let only ~30 tiles/s through (cache load log 2026-11-22: 1028 tiles in 34.6 s, server needed 37.6 s for the same). */
+    private static final long UPLOAD_BACKLOG_NS = 8_000_000L;
+    private static final int UPLOAD_BACKLOG = 48;
     private static final int RING_CHECK_TICKS = 10;
+    /** Ticks a changed setting of the mesh (Block Heightmap, trees) has to stay unchanged before the tiles are built again: a slider moves through many values. */
+    private static final int REMESH_DELAY_TICKS = 10;
     /** How many checks (of {@link #RING_CHECK_TICKS} ticks) vanilla's loaded chunks have to hold before they are taken as drawn: 10 seconds. */
     private static final int GROW_SAMPLES = 20;
     /** How many levels of bigger tiles over a drawn tile are kept with it. */
@@ -68,7 +82,17 @@ public final class LodManager {
 
     private final Minecraft minecraft;
     private final ClientConfig config;
+    /** The planner runs on a thread of its own (its tree walk and sorting were work for the main thread every tick); it is touched only by that thread. */
     private final Planner planner = new Planner();
+    private final ExecutorService planWorker;
+    private final AtomicBoolean planBusy = new AtomicBoolean();
+    private final AtomicReference<PlanResult> planDone = new AtomicReference<>();
+    /** The plan the main thread works from: the newest one the planner thread has finished. Empty until the first. */
+    private PlanResult plan = new PlanResult(0, new long[0], 0, new long[0], 0, 0, 1.0);
+
+    /** What the planner made: the tiles to draw, and the tiles to ask for, most urgent first. Never changed after it is made. */
+    private record PlanResult(int epoch, long[] draw, int drawCount, long[] want, int wantCount, int leafCount, double zoneScale) {
+    }
     private final Planner.Params params = new Planner.Params();
     private final Map<Long, Tile> tiles = new HashMap<>();
     private final Map<Long, Long> pending = new HashMap<>();
@@ -76,22 +100,23 @@ public final class LodManager {
     private boolean horizonReported;
     private int tilesFromServer;
     private int tilesFromDisk;
+    /** Debug counters for the horizon line: tiles meshed, ns reading+decoding, ns meshing, tiles uploaded, ns uploading. */
+    private final AtomicLong statMeshed = new AtomicLong(), statReadNs = new AtomicLong(), statMeshNs = new AtomicLong(), statUploaded = new AtomicLong(), statUploadNs = new AtomicLong();
     private final ConcurrentLinkedQueue<Built> built = new ConcurrentLinkedQueue<>();
     private final ExecutorService workers;
     private final VertexArena arena = new VertexArena("terrain", ARENA_BLOCK_BYTES, GpuBuffer.USAGE_INDEX);
     private volatile int epoch;
-    /** How much the view is zoomed in (1 = not; 8 = eight times), from the field of view; the planner splits tiles that much earlier. */
-    private volatile double zoom = 1.0;
-    /** The direction the camera looks in and the half angle of its view (the screen's diagonal), set by the renderer every frame. */
-    private volatile double lookX;
-    private volatile double lookY;
-    private volatile double lookZ = 1.0;
-    private volatile double coneHalf = Math.PI;
     private BeyondTheHorizonPayloads.Hello hello;
     private ClientLevel level;
     private long tick;
     private double lastCamX;
     private double lastCamZ;
+    /** The settings the tiles' meshes were built with; when they change the loaded tiles are built again, see {@link #checkMeshSettings}. */
+    private int meshSignature;
+    private long meshSignatureChangedTick;
+    private boolean meshSettingsDirty;
+    /** Raised at every rebuild of the loaded tiles, so that the tasks of an older one end. */
+    private volatile int remeshGeneration;
     /** How fast the camera moves, in blocks per second, smoothed over about a second. */
     private double camSpeed;
     private boolean hasLastCam;
@@ -120,7 +145,14 @@ public final class LodManager {
     public LodManager(Minecraft minecraft, ClientConfig config) {
         this.minecraft = minecraft;
         this.config = config;
+        this.meshSignature = meshSignature(config);
         int threads = Mth.clamp(Runtime.getRuntime().availableProcessors() / 2, 1, 3);
+        this.planWorker = Executors.newSingleThreadExecutor(runnable -> {
+            Thread thread = new Thread(runnable, "Beyond the Terrain planner");
+            thread.setDaemon(true);
+            thread.setPriority(Thread.NORM_PRIORITY - 1);
+            return thread;
+        });
         this.workers = Executors.newFixedThreadPool(threads, runnable -> {
             Thread thread = new Thread(runnable, "Beyond the Terrain mesher");
             thread.setDaemon(true);
@@ -151,6 +183,24 @@ public final class LodManager {
         return this.reach > 0.0F ? this.reach : this.config.distanceBlocks();
     }
 
+    /**
+     * The far plane the game's own projection is given under a shader pack, so that the terrain drawn with it and everything the pack
+     * works out from the depth (the distance of a pixel, so its fog) agree: the terrain reaches {@link #activeLodDistance()} and is
+     * drawn up to a height of some thousand blocks above and below the camera.
+     */
+    public float packFar() {
+        return this.activeLodDistance() * 2.0F + 6144.0F;
+    }
+
+    /**
+     * How many chunks, from the player's own, vanilla draws all round in a square that the terrain leaves out (less the margin of
+     * {@link #OWNED_MARGIN}); under 1 when there is none. The planner leaves out the tiles lying wholly inside it, and so does the
+     * renderer, once more, with the camera of the frame, see LodRenderer.
+     */
+    public int ownHalf() {
+        return this.ownRadius - 1 - OWNED_MARGIN;
+    }
+
     public boolean isActive() {
         ClientLevel clientLevel = this.minecraft.level;
         return this.config.enabled && this.hello != null && this.hello.enabled() && this.hello.protocol() == BeyondTheHorizonConstants.PROTOCOL_VERSION
@@ -163,7 +213,7 @@ public final class LodManager {
         this.hello = hello;
         this.reset();
         if (hello.protocol() != BeyondTheHorizonConstants.PROTOCOL_VERSION) {
-            LOGGER.warn("Server uses protocol {}, this client {}: the distant terrain is off", hello.protocol(), BeyondTheHorizonConstants.PROTOCOL_VERSION);
+            LOGGER.warn("Server uses protocol {}, this client {}: the Heightmap LOD is off", hello.protocol(), BeyondTheHorizonConstants.PROTOCOL_VERSION);
         }
     }
 
@@ -210,6 +260,7 @@ public final class LodManager {
     /** Decodes and builds a tile, on a worker; tiles from the server are written to the disk cache once they are known to be whole. */
     private void mesh(TilePos pos, byte[] data, TileCache toCache, boolean fromCache, Registry<Biome> biomes, int seaLevel, int epoch) {
         long key = pos.pack();
+        long decodeStart = System.nanoTime();
         {
             MeshBuilder.Mesh mesh = null;
             try {
@@ -218,8 +269,19 @@ public final class LodManager {
                     toCache.write(key, data);
                 }
                 long meshStart = System.nanoTime();
-                mesh = TileMesher.mesh(tile, pos, biomes, seaLevel, this.config().treeLevel, this.config().treeDensity, this.config().treeBillboardLevel, this.config().stepLevel);
+                this.statReadNs.addAndGet(meshStart - decodeStart);
+                // How far the tile is from the camera now, for the distances of the stepped columns and the trees (see ClientConfig); unknown (-1) before the first tick.
+                double distance = -1.0;
+                if (this.hasLastCam) {
+                    double dx = Math.max(0.0, Math.max(pos.minX() - this.lastCamX, this.lastCamX - (pos.minX() + pos.size())));
+                    double dz = Math.max(0.0, Math.max(pos.minZ() - this.lastCamZ, this.lastCamZ - (pos.minZ() + pos.size())));
+                    distance = Math.sqrt(dx * dx + dz * dz);
+                }
+                mesh = TileMesher.mesh(tile, pos, biomes, seaLevel, this.config().trees, this.config().treeDensity, this.config().blockHeightmap,
+                    distance, this.config().treeDistance, this.config().blockHeightmapDistance);
                 PerfStats.add(PerfStats.Timer.MESH, System.nanoTime() - meshStart);
+                this.statMeshNs.addAndGet(System.nanoTime() - meshStart);
+                this.statMeshed.incrementAndGet();
             } catch (IOException | RuntimeException e) {
                 if (fromCache) {
                     // A bad file: the server is asked instead.
@@ -229,6 +291,67 @@ public final class LodManager {
                 LOGGER.warn("Could not build tile {}", pos, e);
             }
             this.built.add(new Built(epoch, key, pos, mesh));
+        }
+    }
+
+    /** What the mesh of a tile depends on in the settings: when it changes, the tiles already built have to be built again. */
+    private static int meshSignature(ClientConfig c) {
+        int h = c.blockHeightmap ? 1 : 0;
+        h = h * 31 + c.blockHeightmapDistance;
+        h = h * 31 + (c.trees ? 1 : 0);
+        h = h * 31 + c.treeDensity;
+        h = h * 31 + c.treeDistance;
+        return h;
+    }
+
+    /**
+     * The Block Heightmap and the trees are changed while playing: once the settings have stopped changing for a moment (a slider passes
+     * through many values) every tile that is loaded is read from the disk cache and built again, the nearest first, and replaces its
+     * old mesh when it is ready, so the picture never has a gap.
+     */
+    private void checkMeshSettings() {
+        int signature = meshSignature(this.config());
+        if (signature != this.meshSignature) {
+            this.meshSignature = signature;
+            this.meshSignatureChangedTick = this.tick;
+            this.meshSettingsDirty = true;
+        }
+        if (this.meshSettingsDirty && this.tick - this.meshSignatureChangedTick >= REMESH_DELAY_TICKS) {
+            this.meshSettingsDirty = false;
+            this.remeshAll();
+        }
+    }
+
+    private void remeshAll() {
+        TileCache cache = this.cache();
+        ClientLevel clientLevel = this.minecraft.level;
+        if (cache == null || clientLevel == null || this.tiles.isEmpty()) {
+            return;
+        }
+        Registry<Biome> biomes = clientLevel.registryAccess().lookupOrThrow(Registries.BIOME);
+        int seaLevel = clientLevel.getSeaLevel();
+        int epoch = this.epoch;
+        int generation = ++this.remeshGeneration;
+        double camX = this.lastCamX;
+        double camZ = this.lastCamZ;
+        List<Tile> held = new ArrayList<>(this.tiles.values());
+        held.sort(Comparator.comparingDouble((Tile t) -> {
+            double dx = t.minX + t.size * 0.5 - camX;
+            double dz = t.minZ + t.size * 0.5 - camZ;
+            return dx * dx + dz * dz;
+        }));
+        for (Tile tile : held) {
+            TilePos pos = tile.pos;
+            long key = tile.key;
+            this.workers.execute(() -> {
+                if (generation != this.remeshGeneration || epoch != this.epoch) {
+                    return;
+                }
+                byte[] data = cache.read(key);
+                if (data != null) {
+                    this.mesh(pos, data, cache, true, biomes, seaLevel, epoch);
+                }
+            });
         }
     }
 
@@ -294,14 +417,18 @@ public final class LodManager {
             this.uploadBuiltTimed();
         } finally {
             PerfStats.add(PerfStats.Timer.UPLOAD, System.nanoTime() - uploadStart);
+            this.statUploadNs.addAndGet(System.nanoTime() - uploadStart);
         }
     }
 
     private void uploadBuiltTimed() {
-        long deadline = System.nanoTime() + UPLOAD_NS;
+        long deadline = System.nanoTime() + (this.built.size() > UPLOAD_BACKLOG ? UPLOAD_BACKLOG_NS : UPLOAD_NS);
         Built b;
         while ((b = this.built.poll()) != null) {
             if (b.epoch != this.epoch) {
+                if (b.mesh != null) {
+                    MeshBuilder.release(b.mesh.data());
+                }
                 continue;
             }
             Tile old = this.tiles.remove(b.key);
@@ -316,6 +443,7 @@ public final class LodManager {
                 int size = data.remaining();
                 VertexArena.Part part = this.arena.allocate(size);
                 RenderSystem.getDevice().createCommandEncoder().writeToBuffer(part.slice(0, size), data);
+                MeshBuilder.release(data);
                 tile.part = part;
                 tile.groundIndexCount = mesh.groundIndexCount();
                 tile.ownGroundIndexOffset = mesh.ownGroundIndexOffset();
@@ -335,6 +463,7 @@ public final class LodManager {
                 tile.maxY = mesh.maxY();
                 tile.waterLevel = mesh.waterLevel();
             }
+            this.statUploaded.incrementAndGet();
             this.tiles.put(b.key, tile);
             this.pending.remove(b.key);
             this.localKeys.remove(b.key);
@@ -345,18 +474,6 @@ public final class LodManager {
     }
 
     // ---- per tick
-
-    /** Called by the renderer each frame with the field of view the game draws with and the one set in the options, both in radians. */
-    public void setView(double fovNow, double fovOption, double aspect, double lookX, double lookY, double lookZ) {
-        this.lookX = lookX;
-        this.lookY = lookY;
-        this.lookZ = lookZ;
-        this.coneHalf = Math.atan(Math.tan(Math.max(fovNow, 0.01) * 0.5) * Math.sqrt(1.0 + aspect * aspect));
-        double ratio = Math.tan(fovOption * 0.5) / Math.tan(Math.max(fovNow, 0.01) * 0.5);
-        // Only zooming in counts, in steps of about 1.4x up to 32x, so that the planner does not change its mind at every frame.
-        double steps = Math.floor(Math.log(Math.max(ratio, 1.0)) / Math.log(Math.sqrt(2.0)) + 0.25);
-        this.zoom = Math.min(32.0, Math.pow(Math.sqrt(2.0), Math.max(steps, 0.0)));
-    }
 
     public void tick() {
         long tickStart = System.nanoTime();
@@ -369,6 +486,7 @@ public final class LodManager {
 
     private void tickTimed() {
         this.tick++;
+        this.checkMeshSettings();
         ClientLevel clientLevel = this.minecraft.level;
         if (clientLevel != this.level) {
             this.level = clientLevel;
@@ -402,13 +520,14 @@ public final class LodManager {
         this.reach = reach;
         p.reach = reach;
         p.splitFactor = this.config.sharpness / 10.0;
-        p.zoom = this.zoom;
-        p.lookX = this.lookX;
-        p.lookY = this.lookY;
-        p.lookZ = this.lookZ;
-        p.coneHalf = this.coneHalf;
-        // A narrow view (zoomed in far) gets a narrow margin: the tiles it adds are the dear ones, and a wide margin would be most of the cone.
-        p.zoomMargin = Math.max(0.03, Math.min(0.2, 0.6 * this.coneHalf));
+        // The Block Heightmap and the box trees keep the tiles near the camera fine, as far as their distances say.
+        p.blockDistance = this.config.blockHeightmap ? this.config.blockHeightmapDistance : 0.0;
+        p.treeDistance = this.config.trees ? this.config.treeDistance : 0.0;
+        // The Block Heightmap's own finest tiles (spacing 1) close to the camera, whatever Start level says; beyond them it is spacing 2.
+        p.hardMin = Math.max(this.hello.minLevel(), 0);
+        // The plan stays under the memory limit (a little less: stand-ins and parents are held too), see Planner.zoneScale.
+        p.maxLeaves = (int) (this.config.maxTiles * 0.8);
+        p.blockFineDistance = this.config.blockHeightmap ? Math.min(this.config.blockHeightmapDistance, BLOCK_FINE_BLOCKS) : 0.0;
         p.minLevel = Math.max(Math.max(this.config.startLevel, this.hello.minLevel()), 0);
         // What vanilla draws: the square of chunks around the player that are all loaded, less two chunks all round, so that the
         // terrain at its edge is ready when chunks are unloaded or not built yet.
@@ -421,12 +540,38 @@ public final class LodManager {
         } else {
             p.ownX0 = p.ownX1 = p.ownZ0 = p.ownZ1 = 0.0;
         }
-        this.planner.plan(p, key -> this.tiles.containsKey(key));
-        Planner planner = this.planner;
+        // The plan of the last round is taken, and the next is started from what is here now (the tiles loaded, the camera). The plan is
+        // one or two ticks old when it is used: tiles that came since are checked again where it is used.
+        PlanResult done = this.planDone.getAndSet(null);
+        if (done != null && done.epoch() == this.epoch) {
+            this.plan = done;
+        }
+        if (this.planBusy.compareAndSet(false, true)) {
+            Planner.Params snapshot = p.copy();
+            LongOpenHashSet loadedNow = new LongOpenHashSet(this.tiles.size() * 2 + 16);
+            for (Long loadedKey : this.tiles.keySet()) {
+                loadedNow.add(loadedKey.longValue());
+            }
+            int planEpoch = this.epoch;
+            this.planWorker.execute(() -> {
+                try {
+                    this.planner.plan(snapshot, loadedNow::contains);
+                    this.planner.sortWanted();
+                    Planner made = this.planner;
+                    this.planDone.set(new PlanResult(planEpoch, java.util.Arrays.copyOf(made.draw, made.drawCount), made.drawCount,
+                        java.util.Arrays.copyOf(made.want, made.wantCount), made.wantCount, made.leafCount, made.zoneScale));
+                } catch (RuntimeException e) {
+                    LOGGER.warn("The planner failed", e);
+                } finally {
+                    this.planBusy.set(false);
+                }
+            });
+        }
+        PlanResult plan = this.plan;
         List<Tile> draw = this.drawScratch;
         draw.clear();
-        for (int i = 0; i < planner.drawCount; i++) {
-            Tile tile = this.tiles.get(planner.draw[i]);
+        for (int i = 0; i < plan.drawCount(); i++) {
+            Tile tile = this.tiles.get(plan.draw()[i]);
             if (tile != null) {
                 tile.lastUsed = this.tick;
                 if (tile.drawable()) {
@@ -514,14 +659,14 @@ public final class LodManager {
         }
         // The planner's list holds only the tiles that are wanted and not there yet. So the horizon is complete when nothing is wanted
         // and no request is on its way. A finer level can still turn up once a coarser one is there, so it has to hold for two checks.
-        boolean quiet = this.planner.wantCount == 0 && this.pending.isEmpty() && this.tilesFromServer + this.tilesFromDisk > 0;
+        boolean quiet = this.plan.wantCount() == 0 && this.pending.isEmpty() && this.tilesFromServer + this.tilesFromDisk > 0;
         // The debug log says every 5 seconds what is still missing, so that a horizon that does not complete can be understood.
         if (com.anonymous.beyondthehorizon.BeyondTheHorizonDebug.ENABLED && this.tick % 100 == 0) {
             int missingAsked = 0;
             int missingNotAsked = 0;
             StringBuilder sample = new StringBuilder();
-            for (int i = 0; i < this.planner.wantCount; i++) {
-                long key = this.planner.want[i];
+            for (int i = 0; i < this.plan.wantCount(); i++) {
+                long key = this.plan.want()[i];
                 if (this.pending.containsKey(key)) {
                     missingAsked++;
                 } else {
@@ -533,9 +678,11 @@ public final class LodManager {
                 }
             }
             LOGGER.info(String.format(java.util.Locale.ROOT,
-                "[FarPlane perf] client horizon: %d tiles still wanted (%d asked and not answered, %d not asked yet), %d held (memory limit %d), %d from server, %d from disk;%s",
-                this.planner.wantCount, missingAsked, missingNotAsked, this.tiles.size(), this.config.maxTiles,
-                this.tilesFromServer, this.tilesFromDisk, sample));
+                "[FarPlane perf] client horizon: %d tiles still wanted (%d asked and not answered, %d not asked yet), %d held (memory limit %d), %d from server, %d from disk | meshed %d (read+decode avg %.1f ms, mesh avg %.1f ms), uploaded %d (%.0f ms total), built waiting %d, plan %d tiles, zone scale %.2f;%s",
+                this.plan.wantCount(), missingAsked, missingNotAsked, this.tiles.size(), this.config.maxTiles,
+                this.tilesFromServer, this.tilesFromDisk,
+                this.statMeshed.get(), this.statReadNs.get() / 1.0e6 / Math.max(1L, this.statMeshed.get()), this.statMeshNs.get() / 1.0e6 / Math.max(1L, this.statMeshed.get()),
+                this.statUploaded.get(), this.statUploadNs.get() / 1.0e6, this.built.size(), this.plan.leafCount(), this.plan.zoneScale(), sample));
         }
         this.horizonQuiet = quiet ? this.horizonQuiet + 1 : 0;
         if (this.horizonQuiet < 2) {
@@ -561,16 +708,15 @@ public final class LodManager {
             this.cacheMiss.add(failed);
         }
         boolean canAsk = now >= this.waitingForClearUntil && ClientPlayNetworking.canSend(BeyondTheHorizonPayloads.TileRequest.TYPE);
-        Planner planner = this.planner;
-        planner.sortWanted();
+        PlanResult plan = this.plan;
         TileCache cache = this.cache();
         // Tiles read from disk and tiles asked for from the server have limits of their own: reading is quick, generating is not.
         int serverRoom = Math.min(MAX_PENDING - (this.pending.size() - this.localKeys.size()), BeyondTheHorizonPayloads.MAX_REQUESTS_PER_PACKET);
         int localRoom = MAX_LOCAL_PENDING - this.localKeys.size();
         int[] out = new int[Math.max(0, serverRoom) * 3];
         int n = 0;
-        for (int i = 0; i < planner.wantCount; i++) {
-            long key = planner.want[i];
+        for (int i = 0; i < plan.wantCount(); i++) {
+            long key = plan.want()[i];
             if (this.pending.containsKey(key) || this.tiles.containsKey(key)) {
                 continue;
             }
@@ -654,6 +800,7 @@ public final class LodManager {
     /** Forgets every tile, and makes the meshes still being built useless. */
     public void reset() {
         this.epoch++;
+        this.plan = new PlanResult(this.epoch, new long[0], 0, new long[0], 0, 0, 1.0);
         for (Tile tile : this.tiles.values()) {
             tile.close();
         }
@@ -678,6 +825,7 @@ public final class LodManager {
 
     public void close() {
         this.workers.shutdownNow();
+        this.planWorker.shutdownNow();
         this.reset();
         this.arena.close();
     }

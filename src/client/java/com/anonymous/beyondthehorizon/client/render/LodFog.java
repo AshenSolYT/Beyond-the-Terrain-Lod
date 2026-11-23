@@ -8,6 +8,7 @@ import com.mojang.renderpearl.api.buffers.GpuBufferSlice;
 import net.minecraft.client.renderer.MappableRingBuffer;
 import net.minecraft.client.renderer.fog.FogData;
 import net.minecraft.client.renderer.fog.FogRenderer;
+import net.minecraft.util.Mth;
 import net.minecraft.world.level.material.FogType;
 import org.joml.Vector4f;
 import org.jspecify.annotations.Nullable;
@@ -36,6 +37,57 @@ public final class LodFog {
     public static boolean followVanilla;
     /** Whether this mod's own fog is out of water this frame; the fog color follows it on the next, see AtmosphericFogEnvironmentMixin. */
     public static boolean ownFog;
+
+    /** How long the fog takes to close in or open out to a new distance (seconds, the time constant of an exponential approach). */
+    private static final float EASE_SECONDS = 0.6F;
+    // The distances of this mod's own fog, eased from frame to frame; one source for vanilla's terrain (FogRendererMixin, which sets them
+    // each frame) and for the LOD terrain (compute), so that both always have exactly the same fog. Negative: nothing yet, the next one is taken as it is.
+    private static float easedStart = -1.0F;
+    private static float easedEnd = -1.0F;
+    private static long easedAt;
+
+    /**
+     * Moves this mod's fog distances towards the ones wanted this frame, so that the fog does not jump when the terrain comes into the
+     * view or goes (the end moves between vanilla's edge and the end of the terrain), or when the end of the terrain changes as tiles load.
+     * Called once a frame, by FogRendererMixin; a second call within the same frame moves it by next to nothing.
+     */
+    public static void ease(float targetStart, float targetEnd) {
+        long now = System.nanoTime();
+        float seconds = easedAt == 0L ? 0.0F : Mth.clamp((now - easedAt) / 1.0E9F, 0.0F, 0.25F);
+        easedAt = now;
+        if (easedEnd < 0.0F) {
+            easedStart = targetStart;
+            easedEnd = targetEnd;
+            return;
+        }
+        float k = 1.0F - (float) Math.exp(-seconds / EASE_SECONDS);
+        easedStart += (targetStart - easedStart) * k;
+        easedEnd += (targetEnd - easedEnd) * k;
+        // Close enough: taken as it is, so that the fog does not creep for ever.
+        if (Math.abs(targetEnd - easedEnd) < Math.max(1.0F, targetEnd * 0.002F)) {
+            easedStart = targetStart;
+            easedEnd = targetEnd;
+        }
+    }
+
+    /** Forgets the eased distances (a fog that is not this mod's own): the next one is taken as it is. */
+    public static void resetEase() {
+        easedStart = -1.0F;
+        easedEnd = -1.0F;
+        easedAt = 0L;
+    }
+
+    public static boolean hasEased() {
+        return easedEnd >= 0.0F;
+    }
+
+    public static float easedStart() {
+        return easedStart;
+    }
+
+    public static float easedEnd() {
+        return easedEnd;
+    }
 
     // Vanilla's fog of the atmosphere for this frame, before other mods change it (Sodium Extra sets its own fog distance there).
     private static boolean atmosphereSet;
@@ -94,8 +146,9 @@ public final class LodFog {
      */
     public void compute(ClientConfig settings, DimensionKind dimension, FogType fogType, boolean vision, int renderDistance, float lodDistance) {
         float vanillaRange = renderDistance * 16.0F;
-        float end = lodDistance;
-        float start = settings.fogStart(end);
+        // The distances vanilla's terrain has this frame (FogRendererMixin eased them), the same for both; without them the plain ones.
+        float end = LodFog.hasEased() && ownFog ? easedEnd : lodDistance;
+        float start = LodFog.hasEased() && ownFog ? easedStart : settings.fogStart(end);
         this.round = true;
         boolean inFluid = fogType != FogType.NONE;
         this.environmentalStart = vanillaEnvironmentalStart;
@@ -106,13 +159,22 @@ public final class LodFog {
         if (!inFluid && !vision && !followVanilla) {
             // Fog close around the camera (rain) is vanilla's and goes on over the LOD terrain; the far one of the atmosphere and that
             // of the End would turn the LOD terrain into fog color long before its end, so they are left out: this mod's fog takes
-            // their place (it is always measured round, and would hide the shape of this mod's fog).
-            if (vanillaEnvironmentalEnd >= vanillaRange || dimension == DimensionKind.END) {
+            // their place (it is measured round, and would hide the shape of this mod's fog).
+            boolean replaced = vanillaEnvironmentalEnd >= vanillaRange || dimension == DimensionKind.END;
+            if (replaced) {
                 this.environmentalStart = NONE;
                 this.environmentalEnd = NONE;
             }
+            // Where this mod's fog is vanilla's environmental one (round) the terrain has it round; with fog close around the camera in
+            // place (rain) it is vanilla's render-distance fog, which is cylindrical: the LOD terrain measures it the same way.
+            this.round = replaced;
             this.renderDistanceStart = start;
             this.renderDistanceEnd = end;
+        } else {
+            // The render-distance fog of vanilla goes on over the LOD terrain: it is cylindrical there (the horizontal distance), so it is
+            // here too, or a fog from another mod or of vanilla's would end in a line along the edge of vanilla's chunks, where its
+            // cylinder meets this mod's sphere.
+            this.round = false;
         }
         // No fog out of water, or none under water (then a wall ends the view there, the terrain is not drawn); the fog of
         // blindness and darkness always stays.
@@ -124,25 +186,10 @@ public final class LodFog {
         }
     }
 
-    /**
-     * Where vanilla's fog, as other mods (Sodium Extra, Simple Fog Control) have left it, becomes solid; {@link #NONE} if it never does
-     * or none is known yet. Beyond it nothing of the LOD terrain can be seen.
-     */
-    public static float vanillaFogEnd() {
-        float end = NONE;
-        if (vanillaRenderDistanceEnd > 0.0F && vanillaRenderDistanceEnd < NONE) {
-            end = vanillaRenderDistanceEnd;
-        }
-        if (vanillaEnvironmentalEnd > 0.0F && vanillaEnvironmentalEnd < end) {
-            end = vanillaEnvironmentalEnd;
-        }
-        return end;
-    }
-
     /** Where the fog ends for a tile whose nearest point lies at these distances: beyond it the tile is all fog color. */
     public boolean hides(double distance, double horizontal, double vertical) {
-        // Radial fog: the 3D distance to the nearest point of the tile, whatever the shape flag says.
-        return distance > this.environmentalEnd || distance > this.renderDistanceEnd;
+        // The environmental fog is always round; the render-distance fog is round with this mod's own fog and cylindrical with vanilla's.
+        return distance > this.environmentalEnd || (this.round ? distance : horizontal) > this.renderDistanceEnd;
     }
 
     /** Writes this frame's fog for the LOD shaders; must happen before the pass that uses it is opened. */

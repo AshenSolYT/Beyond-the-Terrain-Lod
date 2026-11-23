@@ -21,6 +21,14 @@ public final class Planner {
     private static final int DESCENT = 3;
     /** A tile that was split stays split until the camera is this much farther than where it split, so the border does not flicker. */
     private static final double HYSTERESIS = 1.25;
+    /** Within the Block Heightmap distance every tile is split down to this level (spacing 2: the finest the columns are built on). */
+    private static final int BLOCK_ZONE_LEVEL = 1;
+    /** Within the Block Heightmap's fine distance tiles go down to the server's finest level (spacing 1: a column per block), whatever Sharpness and Start level say. */
+    private static final int BLOCK_FINE_LEVEL = 0;
+    /** Within the tree distance every tile is split down to this level (spacing 4), fine enough for trees as boxes. */
+    private static final int TREE_ZONE_LEVEL = 2;
+    /** A zone's border moves out by this much for tiles that are split already, so it does not flicker. */
+    private static final double ZONE_HYSTERESIS = 1.1;
     /** While the camera moves fast the tiles are asked for in rings of this width around it, the nearest ring first. */
     private static final double NEAR_BAND = 384.0;
 
@@ -32,18 +40,14 @@ public final class Planner {
         public double reach = 4096.0;
         /** A tile splits while the camera is nearer than its size times this. */
         public double splitFactor = 3.0;
-        /**
-         * How much the view is zoomed in (1 = not): the tiles in the direction the camera looks (within {@link #coneHalf} and a margin)
-         * split that much earlier, the ones outside the view keep {@link #splitFactor}.
-         */
-        public double zoom = 1.0;
-        /** The direction the camera looks in (a unit vector) and the half angle of its view, the diagonal of the screen, in radians. */
-        public double lookX;
-        public double lookY;
-        public double lookZ = 1.0;
-        public double coneHalf = Math.PI;
-        /** Added to {@link #coneHalf} for the zoom detail, in radians. */
-        public double zoomMargin = 0.2;
+        /** How far from the camera tiles are kept fine for the Block Heightmap, in blocks; 0 when it is off. */
+        public double blockDistance;
+        /** How far from the camera tiles are kept fine for the box trees, in blocks; 0 when trees are off. */
+        public double treeDistance;
+        /** How far from the camera tiles go down to {@link #hardMin} for the Block Heightmap, in blocks; 0 when it is off. */
+        public double blockFineDistance;
+        /** The finest level the server has (Start level does not apply to the Block Heightmap's fine zone). */
+        public int hardMin = 0;
         public int minLevel = 1;
         public int maxLevel = BeyondTheHorizonConstants.MAX_LEVEL;
         /** The square vanilla draws, in blocks: [ownX0, ownX1) by [ownZ0, ownZ1); empty when the end is not past the start. */
@@ -56,6 +60,31 @@ public final class Planner {
          * outruns are no use. Otherwise the biggest tiles go first so that the whole picture is there early.
          */
         public boolean nearFirst;
+        /** The most tiles the plan may have (0: no limit): the zones of the Block Heightmap and the trees shrink to stay under it, see {@link Planner#zoneScale}. */
+        public int maxLeaves;
+
+        /** A copy for the planner's own thread: the manager goes on changing its Params while a plan is made. */
+        public Params copy() {
+            Params c = new Params();
+            c.camX = this.camX;
+            c.camY = this.camY;
+            c.camZ = this.camZ;
+            c.reach = this.reach;
+            c.splitFactor = this.splitFactor;
+            c.blockDistance = this.blockDistance;
+            c.treeDistance = this.treeDistance;
+            c.blockFineDistance = this.blockFineDistance;
+            c.hardMin = this.hardMin;
+            c.minLevel = this.minLevel;
+            c.maxLevel = this.maxLevel;
+            c.ownX0 = this.ownX0;
+            c.ownZ0 = this.ownZ0;
+            c.ownX1 = this.ownX1;
+            c.ownZ1 = this.ownZ1;
+            c.nearFirst = this.nearFirst;
+            c.maxLeaves = this.maxLeaves;
+            return c;
+        }
     }
 
     /** Whether a tile is ready to be drawn. */
@@ -71,6 +100,17 @@ public final class Planner {
     public double[] wantScore = new double[256];
     public int wantCount;
 
+    /**
+     * Factor on the three zone distances (Block Heightmap, its fine zone, trees), 1 when the plan fits {@link Params#maxLeaves}. A plan
+     * above the limit makes the client drop the farthest tiles, which are then asked for again: the horizon shrinks and the tiles are
+     * loaded over and over. So the zones shrink instead (the tile count goes with their square) and grow back when there is room.
+     */
+    public double zoneScale = 1.0;
+    /** Tiles the last plan has (the ones drawn or asked for, not split). */
+    public int leafCount;
+    private double blockZone;
+    private double fineZone;
+    private double treeZone;
     private Params p;
     private Loaded loaded;
     /** The tiles that were split in the last plan, and in this one. */
@@ -82,6 +122,10 @@ public final class Planner {
         this.loaded = isLoaded;
         this.drawCount = 0;
         this.wantCount = 0;
+        this.leafCount = 0;
+        this.blockZone = params.blockDistance * this.zoneScale;
+        this.fineZone = params.blockFineDistance * this.zoneScale;
+        this.treeZone = params.treeDistance * this.zoneScale;
         HashSet<Long> swap = this.splitPrev;
         this.splitPrev = this.splitNow;
         this.splitNow = swap;
@@ -93,6 +137,13 @@ public final class Planner {
         for (int z = first; z <= last; z++) {
             for (int x = first; x <= last; x++) {
                 this.cover(level, x, z);
+            }
+        }
+        if (params.maxLeaves > 0) {
+            if (this.leafCount > params.maxLeaves) {
+                this.zoneScale = Math.max(0.05, this.zoneScale * Math.min(0.95, Math.max(0.5, Math.sqrt((double) params.maxLeaves / this.leafCount))));
+            } else if (this.leafCount < params.maxLeaves * 0.75 && this.zoneScale < 1.0) {
+                this.zoneScale = Math.min(1.0, this.zoneScale * 1.03);
             }
         }
     }
@@ -161,15 +212,16 @@ public final class Planner {
         double distance = Math.sqrt(horizontal * horizontal + altitude * altitude);
         long key = TilePos.pack(level, x, z);
         double factor = p.splitFactor * (this.splitPrev.contains(key) ? HYSTERESIS : 1.0);
-        // The extra detail of zooming goes only to what is in the view: the rest of the circle around the camera is not seen.
-        if (p.zoom > 1.0 && this.inView(minX + size * 0.5 - p.camX, REFERENCE_HEIGHT - p.camY, minZ + size * 0.5 - p.camZ, size)) {
-            factor *= p.zoom;
-        }
-        boolean split = level > p.minLevel && distance < size * factor;
+        boolean zone = (this.blockZone > 0.0 && level > BLOCK_ZONE_LEVEL && distance < this.blockZone * (this.splitPrev.contains(key) ? ZONE_HYSTERESIS : 1.0))
+            || (this.treeZone > 0.0 && level > TREE_ZONE_LEVEL && distance < this.treeZone * (this.splitPrev.contains(key) ? ZONE_HYSTERESIS : 1.0));
+        boolean fine = this.fineZone > 0.0 && level > BLOCK_FINE_LEVEL && level > p.hardMin
+            && distance < this.fineZone * (this.splitPrev.contains(key) ? ZONE_HYSTERESIS : 1.0);
+        boolean split = (level > p.minLevel && (zone || distance < size * factor)) || fine;
         if (split) {
             this.splitNow.add(key);
         }
         if (!split) {
+            this.leafCount++;
             if (this.loaded.has(key)) {
                 this.addDraw(key);
                 return true;
@@ -197,22 +249,9 @@ public final class Planner {
         return false;
     }
 
-    /** Whether a tile, given by the vector from the camera to its middle and its size, lies in the direction the camera looks in. */
-    private boolean inView(double dx, double dy, double dz, long size) {
-        Params p = this.p;
-        double length = Math.sqrt(dx * dx + dy * dy + dz * dz);
-        if (length <= size) {
-            return true;
-        }
-        double cos = Math.max(-1.0, Math.min(1.0, (dx * p.lookX + dy * p.lookY + dz * p.lookZ) / length));
-        // The tile is as wide as its size over the distance seen from the camera; the ground under it can also be higher or lower than
-        // the height the middle is taken at, which the margin covers.
-        return Math.acos(cos) <= p.coneHalf + p.zoomMargin + Math.atan2(size * 0.75, length);
-    }
-
     /** Draws the finer tiles that are loaded under a tile; whether they cover it completely. */
     private boolean descend(int level, int x, int z, int depth) {
-        if (depth == 0 || level <= this.p.minLevel) {
+        if (depth == 0 || level <= Math.min(this.p.minLevel, Math.max(this.p.hardMin, 0))) {
             return false;
         }
         boolean all = true;

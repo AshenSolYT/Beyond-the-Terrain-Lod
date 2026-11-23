@@ -5,10 +5,20 @@
 #include <minecraft:fog.glsl>
 #include <minecraft:dynamictransforms.glsl>
 
+#ifdef PIXEL_COLOR
+#define NOISE
+#endif
+
 layout(location = 0) in float sphericalVertexDistance;
+layout(location = 1) in float cylindricalVertexDistance;
 layout(location = 2) in vec4 vertexColor;
+layout(location = 6) in vec3 viewPos;
+layout(location = 7) in vec2 groundPos;
 #ifdef PIXEL_COLOR
 layout(location = 3) in vec2 localXZ;
+#endif
+#ifdef NOISE
+layout(location = 8) in vec3 noisePos;
 #endif
 #ifdef SPRITES
 layout(location = 3) in vec3 spriteInfo;
@@ -33,7 +43,21 @@ int spritePixel(int id, vec2 uv) {
 }
 #endif
 
-#ifdef PIXEL_COLOR
+#ifdef STEPPED
+// A light from the east, south and above, and how much of the light the unlit side keeps. The tops of the terrain come out as 1.
+const vec3 SUN = normalize(vec3(0.45, 0.80, 0.40));
+const float AMBIENT = 0.50;
+// How dark the mesh builder made the walls against the tops, by the side they face (MeshBuilder: WALL_EAST_WEST, WALL_NORTH_SOUTH).
+const float BAKED_EAST_WEST = 0.70;
+const float BAKED_NORTH_SOUTH = 0.54;
+
+// The light on a surface of the world-space normal n, against the light on a flat top.
+float surfaceLight(vec3 n) {
+    return AMBIENT + (1.0 - AMBIENT) * max(dot(n, SUN), 0.0) / SUN.y;
+}
+#endif
+
+#ifdef NOISE
 float cellHash(vec2 p) {
     vec3 p3 = fract(vec3(p.xyx) * 0.1031);
     p3 += dot(p3, p3.yzx + 33.33);
@@ -47,9 +71,38 @@ void main() {
     fragColor = vec4(0.0);
     return;
 #endif
-    // The fog is always radial: the render-distance fog is measured like the environmental one, by the 3D distance.
-    float renderDistance = sphericalVertexDistance;
+    // The environmental fog is always measured by the 3D distance. The render-distance fog is too with this mod's own fog (ColorModulator.w 1:
+    // vanilla's terrain has it in the environmental one then, and the two fogs are the same sphere); with vanilla's own, or another mod's,
+    // it is the distance on the ground plane (w 0), as it is on vanilla's terrain, so the fog does not change along the edge of vanilla's chunks.
+    float renderDistance = ColorModulator.w > 0.5 ? sphericalVertexDistance : cylindricalVertexDistance;
     vec4 smoothColor = vertexColor;
+#if defined(NOISE) && !defined(PIXEL_COLOR)
+    // How big a screen pixel is on the ground here, in blocks (before any branch, for the derivatives).
+    vec3 noiseDx = abs(dFdx(noisePos));
+    vec3 noiseDy = abs(dFdy(noisePos));
+    float footprint = max(max(max(noiseDx.x, noiseDx.y), max(noiseDx.z, noiseDy.x)), max(noiseDy.y, noiseDy.z));
+#endif
+#ifdef STEPPED
+    // Only on the stepped columns: their faces are flat and straight, so the slope that the derivatives give is the real one, wall or top.
+    // The smooth ground has its slope in its vertex colors already, taken from the (smoothed) heights of the samples around each vertex
+    // and blended between vertices, so it is lit without a seam across triangles, tiles or chunk borders; a normal taken from the
+    // derivatives would change from one triangle to the next there, and its light would be put on top of the shade that is in the colors.
+    // The slope is taken from how the view-space position changes across the screen (before any branch, for the derivatives):
+    // the normal of the surface in world space, turned to face the camera. The terrain has no normals of its own.
+    vec3 dpdx = dFdx(viewPos);
+    vec3 dpdy = dFdy(viewPos);
+    vec3 faceNormal = cross(dpdx, dpdy);
+    float faceLength = length(faceNormal);
+    vec3 worldNormal = vec3(0.0, 1.0, 0.0);
+    if (faceLength > 1.0e-12) {
+        vec3 viewNormal = faceNormal / faceLength;
+        if (dot(viewNormal, viewPos) > 0.0) {
+            viewNormal = -viewNormal;
+        }
+        // ModelViewMat is the rotation of the view: its transpose turns a view-space direction back into the world.
+        worldNormal = normalize(viewNormal * mat3(ModelViewMat));
+    }
+#endif
 #ifdef SPRITES
     // ColorModulator.x: the distance of vanilla chunks around the camera for trees, inside it they are the real ones; 0 elsewhere.
     if (ColorModulator.x > 0.5 && dot(relativeXZ, relativeXZ) < ColorModulator.x * ColorModulator.x) {
@@ -83,8 +136,33 @@ void main() {
     }
 #endif
     vec4 color = smoothColor;
+#ifdef STEPPED
+    // The walls are darker than the tops already, by their side, in their vertex colors: that is taken out again, and the light of
+    // the surface they really face is put on, so that a cliff is lit on the side of the light and dark on the other, whichever way it runs.
+    float wall = 1.0 - smoothstep(0.3, 0.6, abs(worldNormal.y));
+    float baked = mix(1.0, abs(worldNormal.x) > abs(worldNormal.z) ? BAKED_EAST_WEST : BAKED_NORTH_SOUTH, wall);
+    color.rgb = clamp(color.rgb / baked * surfaceLight(worldNormal), 0.0, 1.0);
+#endif
 #ifdef PIXEL_COLOR
     color.rgb *= 1.0 + (cellHash(cellIndex) * 2.0 - 1.0) * ColorModulator.z;
+#elif defined(NOISE)
+    // The stepped columns and the ground that is drawn smooth (its cells are smaller than a pixel): the noise goes in cells as big as the
+    // tile's, or a pixel when that is bigger (a power of two, so that the grain changes only by whole steps, with the distance), fixed to the world.
+    // ColorModulator.y: the size of a cell in blocks, z: the strength (0 when the pixel filter is off).
+    float grain = max(max(ColorModulator.y, 0.001), exp2(ceil(log2(max(footprint, 1.0e-4)))));
+    vec3 grainIndex = floor(noisePos / grain);
+#ifndef STEPPED
+    grainIndex.y = 0.0;
+#endif
+    color.rgb *= 1.0 + (cellHash(vec2(grainIndex.x + grainIndex.y * 57.0, grainIndex.z)) * 2.0 - 1.0) * ColorModulator.z;
+#endif
+#ifndef SPRITES
+    // Inside the square of vanilla's chunks (the first column of the texture matrix, see LodRenderer: x0, z0, x1, z1 from the camera) vanilla
+    // draws: nothing of the terrain is left there, so the two cannot fight over the depth. Last, after every derivative above.
+    vec4 own = TextureMat[0];
+    if (own.z > own.x && groundPos.x >= own.x && groundPos.x < own.z && groundPos.y >= own.y && groundPos.y < own.w) {
+        discard;
+    }
 #endif
     fragColor = apply_fog(color, sphericalVertexDistance, renderDistance, FogEnvironmentalStart, FogEnvironmentalEnd, FogRenderDistanceStart, FogRenderDistanceEnd, FogColor);
 }

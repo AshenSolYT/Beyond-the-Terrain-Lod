@@ -72,12 +72,12 @@ public final class BeyondTheHorizonCommand {
             {"title", "FarPlaneTwoContinuation commands:"},
             {"fphelp", "/fphelp - this list"},
             {"pregen", "/farplane pregen detail start <radius> - generate the detailed terrain within <radius> chunks (1-256) around you ahead of time"},
-            {"distant", "/farplane pregen distant start <radius> - generate the distant terrain within <radius> blocks around you ahead of time, with all free CPU"},
+            {"distant", "/farplane pregen distant start <radius> - generate the Heightmap LOD within <radius> blocks around you ahead of time, with all free CPU"},
             {"pregen_at", "... start <radius> <x> <z> - the same around the block column x z"},
             {"pregen_status", "/farplane pregen detail|distant status - progress and time left"},
             {"pregen_stop", "/farplane pregen detail|distant stop - stop; what is done stays saved"},
             {"operators", "The /farplane commands are for operators (in singleplayer: with cheats allowed)."},
-            {"keys", "Keys: F7 - distant terrain on/off, F8 - settings, F3 + O - clear the LOD cache. They can be changed in Controls."},
+            {"keys", "Keys: F7 - Heightmap LOD on/off, F8 - settings, F3 + O - clear the LOD cache. They can be changed in Controls."},
         };
         for (String[] line : lines) {
             source.sendSuccess(() -> Component.translatableWithFallback(BeyondTheHorizonConstants.MOD_ID + ".help." + line[0], line[1]), false);

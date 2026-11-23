@@ -75,6 +75,22 @@ final class OverworldTileGenerator {
      */
     private static final int SEA_CHECK = 40;
 
+    /**
+     * The estimate's error (exact surface minus estimate) is much the same from one sample to the next, so the search starts at the
+     * estimate plus the error of the sample before, not at the bare estimate: a few density samples saved on every search. Clamped,
+     * as the search finds the surface from any start, only slower from a far one.
+     */
+    private static final int MAX_HINT_ERROR = 96;
+    /**
+     * Averaged (filtered) tiles do not need the surface to the block: their samples are averaged and smoothed, and what the eye sees is
+     * the shape. Away from the sea level their surface is found on a grid of this many blocks (see DensitySurface.surface), which drops
+     * the last bisection steps of every search. The grid is fixed, so two tiles that share a sample find the same height whatever their
+     * hint was; tiles of other levels never reuse each other's samples (see reuse in generate).
+     */
+    private static final int COARSE_GRAIN = 4;
+    /** From this level on (128+ blocks between samples) the grid is twice as coarse. */
+    private static final int COARSER_LEVEL = 7;
+
     private OverworldTileGenerator() {
     }
 
@@ -139,7 +155,7 @@ final class OverworldTileGenerator {
             // The estimates of all sub-samples first: which cells need an exact look depends on them. Each is written below.
             int[] estimates = state.estimates;
             for (int i = 0; i < TileData.SUB_SAMPLES; i++) {
-                WorkThrottle.yieldToFrames();
+                WorkThrottle.checkpoint();
                 long offsetX = (long) ((i & 1) * 2 - 1) * subStep;
                 long offsetZ = (long) ((i >> 1) * 2 - 1) * subStep;
                 for (int index = 0; index < BeyondTheHorizonConstants.TILE_SAMPLE_COUNT; index++) {
@@ -162,13 +178,18 @@ final class OverworldTileGenerator {
             }
             // One sub-sample position of every cell at a time: each forms a regular grid of its own.
             for (int i = 0; i < TileData.SUB_SAMPLES; i++) {
-                WorkThrottle.yieldToFrames();
+                WorkThrottle.checkpoint();
                 long offsetX = (long) ((i & 1) * 2 - 1) * subStep;
                 long offsetZ = (long) ((i >> 1) * 2 - 1) * subStep;
                 if (climate != null) {
                     climate.sampleGrid(baseX + offsetX, baseZ + offsetZ, spacing);
                 }
+                int lastError = 0;
+                int rowStartError = 0;
                 for (int index = 0; index < BeyondTheHorizonConstants.TILE_SAMPLE_COUNT; index++) {
+                    if (index % S == 0) {
+                        lastError = rowStartError;
+                    }
                     int x = TileGenerator.clampToWorld(baseX + (long) (index % S) * spacing + offsetX);
                     int z = TileGenerator.clampToWorld(baseZ + (long) (index / S) * spacing + offsetZ);
                     int estimate = estimates[i * BeyondTheHorizonConstants.TILE_SAMPLE_COUNT + index];
@@ -180,7 +201,13 @@ final class OverworldTileGenerator {
                             height = fast.seaLevel;
                         }
                     } else {
-                        height = far.surface(x, z, estimate);
+                        // Exact near the sea level (land or water, the coast), on the grid elsewhere.
+                        int grain = far == fast || nearSea(estimate, fast.seaLevel) ? 1 : (pos.level() >= COARSER_LEVEL ? 2 * COARSE_GRAIN : COARSE_GRAIN);
+                        height = far.surface(x, z, estimate + lastError, grain);
+                        lastError = Mth.clamp(height - estimate, -MAX_HINT_ERROR, MAX_HINT_ERROR);
+                        if (index % S == 0) {
+                            rowStartError = lastError;
+                        }
                     }
                     if (height < fast.seaLevel) {
                         subWater[index] |= (short) (1 << i);
@@ -241,11 +268,14 @@ final class OverworldTileGenerator {
         IcebergPillars pillars = state.pillars;
         int previousGround = Integer.MIN_VALUE;
         int rowStart = Integer.MIN_VALUE;
+        int lastError = 0;
+        int rowStartError = 0;
         for (int sz = 0; sz < S; sz++) {
-            WorkThrottle.yieldToFrames();
+            WorkThrottle.checkpoint();
             int blockZ = TileGenerator.clampToWorld(baseZ + (long) sz * spacing);
             // Rows are walked in the same direction, so a new row starts next to the start of the previous one.
             previousGround = rowStart;
+            lastError = rowStartError;
             for (int sx = 0; sx < S; sx++) {
                 int blockX = TileGenerator.clampToWorld(baseX + (long) sx * spacing);
                 int index = sx + sz * S;
@@ -262,11 +292,14 @@ final class OverworldTileGenerator {
                 } else if (neighbourHint && previousGround != Integer.MIN_VALUE) {
                     groundY = search.surface(blockX, blockZ, previousGround);
                 } else {
-                    groundY = search.surface(blockX, blockZ, fast.estimate(blockX, blockZ));
+                    int estimate = fast.estimate(blockX, blockZ);
+                    groundY = search.surface(blockX, blockZ, estimate + lastError);
+                    lastError = Mth.clamp(groundY - estimate, -MAX_HINT_ERROR, MAX_HINT_ERROR);
                 }
                 previousGround = groundY;
                 if (sx == 0) {
                     rowStart = groundY;
+                    rowStartError = lastError;
                 }
                 boolean water = groundY < fast.seaLevel;
                 int surfaceY = water ? fast.seaLevel : groundY;
@@ -411,7 +444,7 @@ final class OverworldTileGenerator {
                 continue;
             }
             if (sx == 0) {
-                WorkThrottle.yieldToFrames();
+                WorkThrottle.checkpoint();
             }
             int x = TileGenerator.clampToWorld(baseX + (long) sx * spacing);
             int z = TileGenerator.clampToWorld(baseZ + (long) sz * spacing);
@@ -654,7 +687,7 @@ final class OverworldTileGenerator {
         int spacing = 1 << pos.level();
         for (int index = 0; index < BeyondTheHorizonConstants.TILE_SAMPLE_COUNT; index++) {
             if (index % S == 0) {
-                WorkThrottle.yieldToFrames();
+                WorkThrottle.checkpoint();
             }
             int blockX = TileGenerator.clampToWorld(pos.minX() + (long) (index % S) * spacing);
             int blockZ = TileGenerator.clampToWorld(pos.minZ() + (long) (index / S) * spacing);
@@ -780,6 +813,11 @@ final class OverworldTileGenerator {
      */
     static final class DensitySurface {
         private static final int STEP = 8;
+        /** Most blocks the first probe of a search jumps by (what the density and the slope ask for). */
+        private static final int MAX_JUMP = 64;
+
+        /** The density change per block at the surface, learned from the searches so far (this object belongs to one thread); 0 until known. */
+        private float slope;
 
         private final DensitySampler sampler;
         private final DensitySampler surfaceEstimate;
@@ -841,6 +879,21 @@ final class OverworldTileGenerator {
          * is passed, then bisection. A close hint takes about five samples, a hint hundreds of blocks off still only a dozen.
          */
         int surface(int x, int z, int hint) {
+            return this.surface(x, z, hint, 1);
+        }
+
+        /**
+         * As {@link #surface(int, int, int)}, but with {@code grain} above 1 the height is found on a fixed grid of that many blocks (the
+         * middle of the grid cell the surface lies in) instead of to the block: the search runs on grid points, which saves
+         * log2(grain) density samples per search and gives the same height for the same place whatever the hint was (as long as the
+         * density is solid below the surface and open above, which the terrain without caves is).
+         *
+         * The density value, not only its sign, is used: the first probe jumps by (density / slope) blocks, with the slope (density
+         * change per block at the surface) learned from the searches before, and the bracket is closed by interpolation between its
+         * ends (regula falsi, with a bisection after two steps on the same side so it cannot crawl). Same bracket as the plain
+         * bisection, so a result is as right as before; it needs fewer samples where the density is smooth, which it is near the surface.
+         */
+        int surface(int x, int z, int hint, int grain) {
             if (ServerPerf.ON) {
                 ServerPerf.SURFACE_SEARCHES.incrementAndGet();
             }
@@ -848,47 +901,106 @@ final class OverworldTileGenerator {
                 return this.minY;
             }
             int guess = Mth.clamp(hint, this.minY, this.maxY);
-            int solidY;
-            int airY;
+            float first = this.density(x, guess, z);
+            int solidY = guess;
+            int airY = guess;
+            float solidD = first;
+            float airD = first;
             int step = STEP;
-            if (this.solid(x, guess, z)) {
-                solidY = guess;
+            // How far the first probe goes: by what the density says when the slope is known, else the plain first step.
+            int jump = this.slope > 0.0F ? Mth.clamp(Math.round(Math.abs(first) / this.slope) + 1, 1, MAX_JUMP) : 0;
+            if (first > 0.0F) {
                 while (true) {
                     if (solidY >= this.maxY) {
                         return this.maxY + 1;
                     }
-                    int probe = Math.min(solidY + step, this.maxY);
-                    if (!this.solid(x, probe, z)) {
+                    int used = jump > 0 ? jump : step;
+                    int probe = Math.min(solidY + used, this.maxY);
+                    float d = this.density(x, probe, z);
+                    if (d <= 0.0F) {
                         airY = probe;
+                        airD = d;
                         break;
                     }
                     solidY = probe;
-                    step <<= 1;
+                    solidD = d;
+                    step = Math.max(step, used) << 1;
+                    jump = 0;
                 }
             } else {
-                airY = guess;
                 while (true) {
                     if (airY <= this.minY) {
                         return this.minY;
                     }
-                    int probe = Math.max(airY - step, this.minY);
-                    if (this.solid(x, probe, z)) {
+                    int used = jump > 0 ? jump : step;
+                    int probe = Math.max(airY - used, this.minY);
+                    float d = this.density(x, probe, z);
+                    if (d > 0.0F) {
                         solidY = probe;
+                        solidD = d;
                         break;
                     }
                     airY = probe;
-                    step <<= 1;
+                    airD = d;
+                    step = Math.max(step, used) << 1;
+                    jump = 0;
                 }
             }
-            while (airY - solidY > 1) {
-                int middle = (solidY + airY) >> 1;
-                if (this.solid(x, middle, z)) {
-                    solidY = middle;
+            boolean grid = grain > 1 && this.minY % grain == 0;
+            // The bracket in grid points (lo at or under the solid ground, hi at or over the air) or, without a grid, in blocks.
+            int lo = grid ? Math.floorDiv(solidY, grain) : solidY;
+            int hi = grid ? Math.floorDiv(airY + grain - 1, grain) : airY;
+            int unit = grid ? grain : 1;
+            // The places and densities last sampled on each side: what the interpolation reads.
+            int loY = solidY;
+            int hiY = airY;
+            float loD = solidD;
+            float hiD = airD;
+            int lastSide = 0;
+            int repeats = 0;
+            while (hi - lo > 1) {
+                int middle;
+                if (repeats >= 2 || !(loD > hiD)) {
+                    middle = (lo + hi) >> 1;
                 } else {
-                    airY = middle;
+                    float cross = loY + loD / (loD - hiD) * (hiY - loY);
+                    middle = Mth.clamp(Math.round(cross / unit), lo + 1, hi - 1);
+                }
+                int at = Math.min(middle * unit, this.maxY);
+                float d = this.density(x, at, z);
+                int side;
+                if (d > 0.0F) {
+                    lo = middle;
+                    loY = at;
+                    loD = d;
+                    side = 1;
+                } else {
+                    hi = middle;
+                    hiY = at;
+                    hiD = d;
+                    side = -1;
+                }
+                repeats = side == lastSide ? repeats + 1 : 0;
+                lastSide = side;
+            }
+            // Learn the slope from the bracket the search ended with: the density change per block right at the surface.
+            if (hiY > loY && hiY - loY <= 2 * unit && loD > hiD) {
+                float local = (loD - hiD) / (hiY - loY);
+                if (Float.isFinite(local) && local > 1.0E-6F) {
+                    this.slope = this.slope > 0.0F ? 0.5F * this.slope + 0.5F * local : local;
                 }
             }
-            return Mth.clamp(solidY + 1, this.minY, this.maxY + 1);
+            if (grid) {
+                return Mth.clamp(hi * grain - (grain >> 1), this.minY, this.maxY + 1);
+            }
+            return Mth.clamp(lo + 1, this.minY, this.maxY + 1);
+        }
+
+        private float density(int x, int y, int z) {
+            if (ServerPerf.ON) {
+                ServerPerf.SURFACE_SAMPLES.incrementAndGet();
+            }
+            return this.sampler.sampleValue(this.context, x, y, z);
         }
     }
 }

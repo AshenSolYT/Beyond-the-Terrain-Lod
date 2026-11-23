@@ -33,13 +33,11 @@ public final class PerfStats {
     private static final int COUNTS = Count.values().length;
     private static final AtomicLongArray NANOS = new AtomicLongArray(TIMERS);
     private static final AtomicLongArray CALLS = new AtomicLongArray(TIMERS);
-    private static final AtomicLongArray WINDOW_COUNTS = new AtomicLongArray(COUNTS);
     private static final AtomicLongArray TOTAL_COUNTS = new AtomicLongArray(COUNTS);
     // The last window that was closed.
     private static final double[] MS_PER_CALL = new double[TIMERS];
     private static final double[] MS_PER_SECOND = new double[TIMERS];
     private static final double[] CALLS_PER_SECOND = new double[TIMERS];
-    private static final double[] COUNTS_PER_SECOND = new double[COUNTS];
     private static long windowStart;
 
     // What the renderer drew in its last frame.
@@ -56,7 +54,6 @@ public final class PerfStats {
     }
 
     public static void count(Count count) {
-        WINDOW_COUNTS.incrementAndGet(count.ordinal());
         TOTAL_COUNTS.incrementAndGet(count.ordinal());
     }
 
@@ -79,9 +76,6 @@ public final class PerfStats {
             MS_PER_SECOND[i] = nanos / 1.0e6 / seconds;
             CALLS_PER_SECOND[i] = calls / seconds;
         }
-        for (int i = 0; i < COUNTS; i++) {
-            COUNTS_PER_SECOND[i] = WINDOW_COUNTS.getAndSet(i, 0L) / seconds;
-        }
         windowStart = now;
     }
 
@@ -95,10 +89,6 @@ public final class PerfStats {
 
     public static synchronized double callsPerSecond(Timer timer) {
         return CALLS_PER_SECOND[timer.ordinal()];
-    }
-
-    public static synchronized double countsPerSecond(Count count) {
-        return COUNTS_PER_SECOND[count.ordinal()];
     }
 
     public static long total(Count count) {

@@ -192,7 +192,7 @@ public final class TreePlanter {
 
     public static @Nullable Trees plant(
         TileData data, TilePos pos, int spacing, float[] ground, boolean[] voids, boolean[] water, int[] colors, int densityPercent,
-        List<Holder<Biome>> biomes, boolean billboards
+        List<Holder<Biome>> biomes, boolean billboards, boolean stepped
     ) {
         int samples = MeshBuilder.SAMPLES;
         List<Identifier> palette = data.palette;
@@ -269,6 +269,10 @@ public final class TreePlanter {
                 float tx = fx - ix;
                 float tz = fz - iz;
                 float y = (g00 * (1 - tx) + g10 * tx) * (1 - tz) + (g01 * (1 - tx) + g11 * tx) * tz;
+                if (stepped) {
+                    // The ground there is a column, rounded down to a block (see MeshBuilder.steps): the tree stands on its top.
+                    y = spacing == 1 ? (float) Math.floor(g00) : (float) Math.floor((g00 + g10 + g01 + g11) / 4.0F);
+                }
                 float height = sp.height * (0.75F + 0.5F * unit(hash(gx, gz, 4))) * clump;
                 int wide = crownWidth(sp.conifer, Math.max(4, Math.round(height)));
                 int meanWide = crownWidth(sp.conifer, Math.max(4, Math.round(sp.height * clump)));

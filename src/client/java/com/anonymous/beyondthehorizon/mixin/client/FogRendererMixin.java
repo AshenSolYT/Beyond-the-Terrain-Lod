@@ -75,6 +75,10 @@ abstract class FogRendererMixin {
         LodFog.followVanilla = mode == ClientConfig.FOG_OTHER || mode == ClientConfig.FOG_AUTO && fluid == FogType.NONE
             && (Math.abs(fog.renderDistanceEnd - vanillaRange) >= 1.0F || LodFog.atmosphereChanged(fog));
         LodFog.ownFog = fluid == FogType.NONE && !LodFog.followVanilla && mode != ClientConfig.FOG_OFF;
+        if (hasVisionEffect(camera) || fluid != FogType.NONE || LodFog.followVanilla || mode == ClientConfig.FOG_OFF) {
+            // Not this mod's own fog: the next time it is, it starts from where it is wanted.
+            LodFog.resetEase();
+        }
         if (hasVisionEffect(camera)) {
             return;
         }
@@ -107,21 +111,30 @@ abstract class FogRendererMixin {
             return;
         }
         LodFog.restoreAtmosphere(fog);
-        if (!manager.hasVisibleTerrain()) {
+        // The end of this mod's fog, eased from frame to frame: it is vanilla's edge while there is no terrain beyond, and the end of the
+        // terrain once there is. A jump between the two (the first tile comes in, the last one goes, the end of the terrain moves as tiles
+        // load) would be a flash of fog over everything; eased, the fog closes in or opens out, and the terrain comes out of it, tile by
+        // tile, as it opens (the renderer leaves out what lies beyond the end). LodFog has the same distances for the LOD terrain.
+        boolean visible = manager.hasVisibleTerrain();
+        float targetEnd = visible ? manager.activeLodDistance() : vanillaRange;
+        float targetStart = visible ? settings.fogStart(targetEnd) : vanillaRange - Mth.clamp(vanillaRange / 10.0F, 4.0F, 64.0F);
+        LodFog.ease(targetStart, targetEnd);
+        float start = LodFog.easedStart();
+        float end = LodFog.easedEnd();
+        if (!visible && end <= vanillaRange + 1.0F) {
             // Vanilla's own fog at the edge of its chunks, over what other mods have set.
             fog.renderDistanceStart = vanillaRange - Mth.clamp(vanillaRange / 10.0F, 4.0F, 64.0F);
             fog.renderDistanceEnd = vanillaRange;
             return;
         }
         // Vanilla's terrain gets the fog of the LOD terrain, see LodFog.
-        float end = manager.activeLodDistance();
-        float start = settings.fogStart(end);
         fog.renderDistanceStart = start;
         fog.renderDistanceEnd = end;
         // The far fog of the atmosphere and the End's own fog (which would turn the islands into flat fog color long before the LOD
         // distance) give way to this mod's. Vanilla measures the environmental fog round and the render-distance fog cylindrical, and
         // the LOD shaders are round, so this mod's fog goes into the environmental one: vanilla's terrain then fades with the same
-        // sphere as the LOD terrain. Rain fog, closer, stays (and then the render-distance fog is kept).
+        // sphere as the LOD terrain. Rain fog, closer, stays (and then the render-distance fog is kept, cylindrical, and the LOD
+        // terrain measures it the same way, see LodFog.compute).
         if (fog.environmentalEnd >= vanillaRange || DimensionKind.of(level) == DimensionKind.END) {
             fog.environmentalStart = start;
             fog.environmentalEnd = end;

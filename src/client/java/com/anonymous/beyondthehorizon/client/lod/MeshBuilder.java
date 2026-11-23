@@ -3,6 +3,7 @@ package com.anonymous.beyondthehorizon.client.lod;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.Arrays;
+import java.util.concurrent.ArrayBlockingQueue;
 import org.jspecify.annotations.Nullable;
 
 /**
@@ -50,13 +51,51 @@ public final class MeshBuilder {
         public boolean sharedIndices() {
             return this.ownGroundIndexOffset < 0;
         }
-
-        public boolean hasWater() {
-            return this.waterIndexCount > 0;
-        }
     }
 
     private MeshBuilder() {
+    }
+
+    /**
+     * Direct buffers of the meshes are reused: a new one for every tile costs a zeroed native allocation each, and the garbage collector
+     * has to notice the old ones to free them (a Block Heightmap tile is over 100 KB). Sizes go in steps of {@link #POOL_STEP}; the render
+     * thread hands a buffer back with {@link #release} once its content is copied to the GPU. {@code -Dbth.nopool=true} turns it off.
+     */
+    private static final int POOL_STEP = 32 * 1024;
+    private static final int POOL_CLASSES = 64;
+    private static final int POOL_PER_CLASS = 16;
+    private static final boolean NO_POOL = Boolean.getBoolean("bth.nopool");
+    @SuppressWarnings("unchecked")
+    private static final ArrayBlockingQueue<ByteBuffer>[] POOL = new ArrayBlockingQueue[POOL_CLASSES];
+
+    static {
+        for (int i = 0; i < POOL_CLASSES; i++) {
+            POOL[i] = new ArrayBlockingQueue<>(POOL_PER_CLASS);
+        }
+    }
+
+    private static ByteBuffer acquire(int total) {
+        int cls = (total + POOL_STEP - 1) / POOL_STEP;
+        if (NO_POOL || cls < 1 || cls > POOL_CLASSES) {
+            return ByteBuffer.allocateDirect(total).order(ByteOrder.nativeOrder());
+        }
+        ByteBuffer buffer = POOL[cls - 1].poll();
+        if (buffer == null) {
+            buffer = ByteBuffer.allocateDirect(cls * POOL_STEP).order(ByteOrder.nativeOrder());
+        }
+        buffer.clear();
+        return buffer;
+    }
+
+    /** Gives the buffer of a mesh back once it is no longer needed; the buffer must not be used after this. */
+    public static void release(ByteBuffer buffer) {
+        if (NO_POOL || buffer == null) {
+            return;
+        }
+        int capacity = buffer.capacity();
+        if (capacity % POOL_STEP == 0 && capacity / POOL_STEP >= 1 && capacity / POOL_STEP <= POOL_CLASSES) {
+            POOL[capacity / POOL_STEP - 1].offer(buffer);
+        }
     }
 
     public static Mesh build(Input in) {
@@ -126,7 +165,7 @@ public final class MeshBuilder {
         int stepIndices = steps == null ? 0 : steps.n;
         int stepVertexOffset = total;
         total += stepVertices * VERTEX_SIZE + stepIndices * 2;
-        ByteBuffer data = ByteBuffer.allocateDirect(total).order(ByteOrder.nativeOrder());
+        ByteBuffer data = acquire(total);
         float skirt = Math.max(spacing * 3.0F, 8.0F);
         for (int z = 0; z < SAMPLES; z++) {
             for (int x = 0; x < SAMPLES; x++) {
@@ -209,13 +248,24 @@ public final class MeshBuilder {
                 this.idx = java.util.Arrays.copyOf(this.idx, this.idx.length * 2);
             }
             int base = this.v;
-            float[] c = {x0, y0, z0, x1, y1, z1, x2, y2, z2, x3, y3, z3};
-            for (int i = 0; i < 4; i++) {
-                this.xyz[(base + i) * 3] = c[i * 3];
-                this.xyz[(base + i) * 3 + 1] = c[i * 3 + 1];
-                this.xyz[(base + i) * 3 + 2] = c[i * 3 + 2];
-                this.col[base + i] = argb;
-            }
+            float[] a = this.xyz;
+            int o = base * 3;
+            a[o] = x0;
+            a[o + 1] = y0;
+            a[o + 2] = z0;
+            a[o + 3] = x1;
+            a[o + 4] = y1;
+            a[o + 5] = z1;
+            a[o + 6] = x2;
+            a[o + 7] = y2;
+            a[o + 8] = z2;
+            a[o + 9] = x3;
+            a[o + 10] = y3;
+            a[o + 11] = z3;
+            this.col[base] = argb;
+            this.col[base + 1] = argb;
+            this.col[base + 2] = argb;
+            this.col[base + 3] = argb;
             this.v += 4;
             this.idx[this.n++] = (short) base;
             this.idx[this.n++] = (short) (base + 1);
@@ -270,7 +320,9 @@ public final class MeshBuilder {
                 has[cell] = true;
             }
         }
-        Steps out = new Steps();
+        Steps out = STEPS_OUT.get();
+        out.v = 0;
+        out.n = 0;
         for (int z = 0; z < CELLS; z++) {
             int x = 0;
             while (x < CELLS) {
@@ -400,6 +452,8 @@ public final class MeshBuilder {
         final boolean[] used = new boolean[CELLS * CELLS];
     }
 
+    /** The vertices of a tile's columns are rebuilt in the same arrays every time (about 80 KB of garbage per tile before); build() copies them out before the next tile. */
+    private static final ThreadLocal<Steps> STEPS_OUT = ThreadLocal.withInitial(Steps::new);
     private static final ThreadLocal<StepScratch> STEP_SCRATCH = ThreadLocal.withInitial(StepScratch::new);
 
     private static float southHeight(float[] tops, boolean[] has, int z, int cx, float h, float skirt) {

@@ -861,21 +861,19 @@ public final class TileServer {
                     try {
                         long start = ServerPerf.ON ? System.nanoTime() : 0L;
                         long cpu = ServerPerf.cpu();
-                        long paused = WorkThrottle.pausedNanos();
                         result = job.detail() ? this.produceDetail(level, job.pos(), loaded, virtual) : this.produce(level, job.pos(), loaded);
                         if (ServerPerf.ON) {
                             (job.detail() ? ServerPerf.DETAIL : ServerPerf.ROUGH).add(System.nanoTime() - start);
                             if (job.detail()) {
                                 ServerPerf.DETAIL_CPU.add(ServerPerf.cpu() - cpu);
-                                ServerPerf.DETAIL_PAUSED.add(WorkThrottle.pausedNanos() - paused);
                             } else {
                                 ServerPerf.ROUGH_CPU.add(ServerPerf.cpu() - cpu);
-                                ServerPerf.ROUGH_PAUSED.add(WorkThrottle.pausedNanos() - paused);
                             }
                         }
                     } catch (WorkThrottle.Cancelled e) {
                         return;
-                    } catch (Exception e) {
+                    } catch (Exception | LinkageError | StackOverflowError e) {
+                        // An Error too: it would end this task before the slot is given back, and 12 of them stop all generation.
                         LOGGER.warn("Failed to generate tile {} in {}", job.pos(), dimension.identifier(), e);
                     } finally {
                         VirtualChunkStore.endTask();

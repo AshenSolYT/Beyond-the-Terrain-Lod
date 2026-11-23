@@ -99,7 +99,7 @@ final class DetailGenerator {
         TileGenerator.Palette palette = new TileGenerator.Palette();
 
         for (int ez = 0; ez < side; ez++) {
-            WorkThrottle.yieldToFrames();
+            WorkThrottle.checkpoint();
             int cz = ez - halo;
             for (int ex = 0; ex < side; ex++) {
                 int cx = ex - halo;
@@ -495,11 +495,14 @@ final class DetailGenerator {
                     summary = cached.summary();
                 } else {
                     long start = ServerPerf.ON ? System.nanoTime() : 0L;
+                    this.readTimedOut = false;
                     summary = this.readSaved(chunkX, chunkZ);
                     if (ServerPerf.ON) {
                         ServerPerf.DETAIL_SAVED.add(System.nanoTime() - start);
                     }
-                    this.saved.put(this.dimension, key, summary);
+                    if (!this.readTimedOut) {
+                        this.saved.put(this.dimension, key, summary);
+                    }
                 }
             } else {
                 summary = null;
@@ -624,8 +627,18 @@ final class DetailGenerator {
         }
 
         /** Reads a chunk from its region file. Chunks of another data version, not generated far enough or broken are skipped. */
+        /** Longest a tile waits for one saved chunk to be read. */
+        private static final int READ_TIMEOUT_SECONDS = 3;
+        private boolean readTimedOut;
+        /** A read of this tile timed out: the others are not tried (the tile waited 41 s, one 4 s timeout after another, in the log of 2026-11-23). */
+        private boolean readsStalled;
+
         private @Nullable ChunkSummary readSaved(int chunkX, int chunkZ) {
             if (!RegionFiles.mayContain(this.level, chunkX, chunkZ)) {
+                return null;
+            }
+            if (this.readsStalled) {
+                this.readTimedOut = true;
                 return null;
             }
             Optional<CompoundTag> tag;
@@ -633,7 +646,19 @@ final class DetailGenerator {
             // server never waits on LOD work for the chunks players actually need.
             DISK_READS.acquireUninterruptibly();
             try {
-                tag = this.level.getChunkSource().chunkMap.read(new ChunkPos(chunkX, chunkZ)).join();
+                tag = this.level.getChunkSource().chunkMap.read(new ChunkPos(chunkX, chunkZ)).get(READ_TIMEOUT_SECONDS, java.util.concurrent.TimeUnit.SECONDS);
+            } catch (java.util.concurrent.TimeoutException e) {
+                // The chunk IO is busy (log of 2026-11-23: a tile waited 47 s for one read, with its CPU work at 0 ms): the tile is built
+                // without this chunk's real surface, and the lack is not remembered, so a later tile can still read it.
+                this.readTimedOut = true;
+                this.readsStalled = true;
+                return null;
+            } catch (java.util.concurrent.ExecutionException e) {
+                LOGGER.debug("Could not read chunk {} {} for a detailed tile", chunkX, chunkZ, e);
+                return null;
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return null;
             } catch (RuntimeException e) {
                 LOGGER.debug("Could not read chunk {} {} for a detailed tile", chunkX, chunkZ, e);
                 return null;

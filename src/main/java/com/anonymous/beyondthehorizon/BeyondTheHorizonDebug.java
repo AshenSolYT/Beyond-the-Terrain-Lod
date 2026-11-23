@@ -14,14 +14,20 @@ public final class BeyondTheHorizonDebug {
     public static final boolean NO_GROUND = Boolean.getBoolean("bth.noground");
     public static final boolean NO_WATER = Boolean.getBoolean("bth.nowater");
     public static final boolean NO_PIXEL = Boolean.getBoolean("bth.nopixel");
-    /** Keeps the pixel filter on tiles whose pixels are smaller than a screen pixel, which are drawn smooth otherwise, see LodRenderer. */
     /** No terrain pass and no depth pass at all, while the manager, the server and the tile loading go on: tells passes from background work. */
     public static final boolean NO_RENDER = Boolean.getBoolean("bth.norender");
     /** The terrain pass runs but vanilla's depth is not cleared after it (the picture breaks): tells what that clear costs. */
     public static final boolean NO_CLEAR = Boolean.getBoolean("bth.noclear");
+    /** Under a shader pack the terrain's depth is kept for the pack; this clears it after the pass again, as without a pack. */
+    public static final boolean PACK_CLEAR = Boolean.getBoolean("bth.packclear");
+    /** The coarser tiles' heights are used as they come, not smoothed (see LodHeightmap). */
+    public static final boolean NO_SMOOTH = Boolean.getBoolean("bth.nosmooth");
     /** Every draw binds a slice of its own again instead of one buffer with a base vertex: tells whether base vertices work as they should. */
     public static final boolean NO_BASE_VERTEX = Boolean.getBoolean("bth.nobasevertex");
+    /** Keeps the pixel filter on tiles whose pixels are smaller than a screen pixel, which are drawn smooth otherwise, see LodRenderer. */
     public static final boolean PIXEL_ALL = Boolean.getBoolean("bth.pixelall");
+    /** Under a shader pack the tiles are drawn whole, without leaving out the cells inside vanilla's square (see LodRenderer.drawCut). */
+    public static final boolean NO_PACK_CUT = Boolean.getBoolean("bth.nopackcut");
 
     private BeyondTheHorizonDebug() {
     }

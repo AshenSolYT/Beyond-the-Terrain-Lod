@@ -7,6 +7,9 @@ import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.util.zip.DataFormatException;
+import java.util.zip.Deflater;
+import java.util.zip.Inflater;
 import java.util.ArrayList;
 import java.util.List;
 import net.minecraft.resources.Identifier;
@@ -31,6 +34,14 @@ public final class TileData {
     public static final int MAX_PALETTE = 256;
     private static final int MAX_ID_LENGTH = 256;
     public static final int MAX_ENCODED_SIZE = 64 * 1024;
+    /**
+     * First byte of the compressed form (0.8.18.9). The old plain form starts with the palette size as a short, at most 256, so its
+     * first byte is 0 or 1 and can never be this: old caches and old data still decode.
+     */
+    private static final int PACKED_MARKER = 0xFF;
+    private static final ThreadLocal<Deflater> DEFLATER = ThreadLocal.withInitial(() -> new Deflater(4, true));
+    private static final ThreadLocal<Inflater> INFLATER = ThreadLocal.withInitial(() -> new Inflater(true));
+    private static final ThreadLocal<byte[]> RAW = ThreadLocal.withInitial(() -> new byte[MAX_ENCODED_SIZE]);
     /** Sub-samples per sample on filtered (coarse) tiles. */
     public static final int SUB_SAMPLES = 4;
 
@@ -128,7 +139,31 @@ public final class TileData {
         this.palette = List.copyOf(palette);
     }
 
+    /**
+     * The compressed form: marker, the length of the plain form (short), then the plain form deflated, with the heights stored as
+     * differences from the sample before (neighbouring heights are close, so the differences are small and deflate well).
+     */
     public byte[] encode() {
+        byte[] raw = this.encodePlain(true);
+        Deflater deflater = DEFLATER.get();
+        deflater.reset();
+        deflater.setInput(raw);
+        deflater.finish();
+        byte[] out = new byte[raw.length + 16];
+        out[0] = (byte) PACKED_MARKER;
+        out[1] = (byte) (raw.length >> 8);
+        out[2] = (byte) raw.length;
+        int n = 3;
+        while (!deflater.finished()) {
+            if (n == out.length) {
+                out = java.util.Arrays.copyOf(out, out.length * 2);
+            }
+            n += deflater.deflate(out, n, out.length - n);
+        }
+        return java.util.Arrays.copyOf(out, n);
+    }
+
+    private byte[] encodePlain(boolean deltaHeights) {
         try {
             ByteArrayOutputStream bytes = new ByteArrayOutputStream(BeyondTheHorizonConstants.TILE_SAMPLE_COUNT * 4 + 512);
             DataOutputStream out = new DataOutputStream(bytes);
@@ -138,8 +173,10 @@ public final class TileData {
                 out.writeShort(text.length);
                 out.write(text);
             }
+            short previous = 0;
             for (short height : this.heights) {
-                out.writeShort(height);
+                out.writeShort(deltaHeights ? (short) (height - previous) : height);
+                previous = height;
             }
             out.write(this.biomes);
             out.write(this.flags);
@@ -178,7 +215,34 @@ public final class TileData {
         if (data.length > MAX_ENCODED_SIZE) {
             throw new IOException("Tile data too large");
         }
-        DataInputStream in = new DataInputStream(new ByteArrayInputStream(data));
+        if (data.length >= 3 && (data[0] & 0xFF) == PACKED_MARKER) {
+            int rawLength = (data[1] & 0xFF) << 8 | data[2] & 0xFF;
+            byte[] raw = RAW.get();
+            Inflater inflater = INFLATER.get();
+            try {
+                inflater.reset();
+                inflater.setInput(data, 3, data.length - 3);
+                int n = 0;
+                while (n < rawLength && !inflater.finished()) {
+                    int got = inflater.inflate(raw, n, rawLength - n);
+                    if (got == 0 && (inflater.needsInput() || inflater.needsDictionary())) {
+                        break;
+                    }
+                    n += got;
+                }
+                if (n != rawLength || !inflater.finished() && inflater.inflate(new byte[1]) != 0) {
+                    throw new IOException("Bad packed tile length");
+                }
+            } catch (DataFormatException e) {
+                throw new IOException("Bad packed tile data");
+            }
+            return parse(new ByteArrayInputStream(raw, 0, rawLength), true);
+        }
+        return parse(new ByteArrayInputStream(data), false);
+    }
+
+    private static TileData parse(ByteArrayInputStream source, boolean deltaHeights) throws IOException {
+        DataInputStream in = new DataInputStream(source);
         int paletteSize = in.readUnsignedShort();
         if (paletteSize == 0 || paletteSize > MAX_PALETTE) {
             throw new IOException("Bad palette size " + paletteSize);
@@ -198,8 +262,11 @@ public final class TileData {
             palette.add(id);
         }
         short[] heights = new short[BeyondTheHorizonConstants.TILE_SAMPLE_COUNT];
+        short previous = 0;
         for (int i = 0; i < heights.length; i++) {
-            heights[i] = in.readShort();
+            short value = in.readShort();
+            heights[i] = deltaHeights ? (short) (value + previous) : value;
+            previous = heights[i];
         }
         byte[] biomes = new byte[BeyondTheHorizonConstants.TILE_SAMPLE_COUNT];
         in.readFully(biomes);

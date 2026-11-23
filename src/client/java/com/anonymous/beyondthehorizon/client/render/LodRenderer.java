@@ -64,11 +64,48 @@ public final class LodRenderer {
     /** Brightness noise of the pixelated filter, as a share: 10 %. */
     private static final float PIXEL_NOISE = 0.035F;
     /**
+     * Under a shader pack: how much of its brightness the terrain keeps, at the edge of vanilla's chunks and at the far end of the LOD
+     * distance. A pack lights the terrain as full lightmap with no shadows, so next to vanilla's real terrain (shaded, with shadows) it
+     * is too bright, most of all at the border where the two meet. The pack multiplies the vertex color by ColorModulator, so this goes
+     * there. 1 = off; for trying values: {@code -Dbth.packexposure=0.7} (edge) and {@code -Dbth.packexposurefar=0.8} (far end).
+     */
+    private static final float PACK_NEAR_EXPOSURE = exposureProperty("bth.packexposure", 0.62F);
+    private static final float PACK_FAR_EXPOSURE = exposureProperty("bth.packexposurefar", 0.78F);
+
+    private static float exposureProperty(String name, float fallback) {
+        try {
+            return Math.max(0.2F, Math.min(1.0F, Float.parseFloat(System.getProperty(name, Float.toString(fallback)))));
+        } catch (NumberFormatException e) {
+            return fallback;
+        }
+    }
+    /**
      * Under a shader pack the terrain is drawn this many blocks lower: the pack's program does the vertex math its own way (and
      * jitters it for its anti-aliasing), so where the terrain lies on the same surface as vanilla's chunks the two fight over the
      * depth and flicker. Lowered, vanilla's chunks always win there; the step is too small to see.
      */
-    private static final float PACK_LOWER = 0.4F;
+    private static final float PACK_LOWER = biasProperty("bth.packlower", 1.0F, 0.0F, 4.0F);
+    /**
+     * Under a shader pack the terrain is also drawn this much further out along every ray from the camera: the view matrix is scaled
+     * about the camera, which leaves the picture as it is (a perspective view does not change when what it shows is scaled about its eye)
+     * and puts the depth of everything a little further, in proportion to its distance, about 1.5 blocks at 100. Where the terrain
+     * lies under vanilla's chunks (the margin around their edge, and the part of a tile that reaches into them) vanilla's chunks are
+     * then in front of it, even where the coarser terrain is higher than the real ground. A pack's program cannot cut it out there,
+     * and a depth bias of the pipeline is not relied on: this works with any pack. (A pack that works out the position of a pixel in
+     * the world from the depth or from this matrix finds it that much further out.)
+     */
+    // Without a pack the bias is in lod_terrain.vsh (LOD_DEPTH_SCALE, 1.015); under a pack it is larger, as the coarser terrain can lie several blocks
+    // over the real ground out where vanilla's chunks end and a pack leaves no other way to cut it out. For trying values: -Dbth.packdepthscale=1.04 and
+    // -Dbth.packlower=1.5 (blocks).
+    private static final float PACK_DEPTH_SCALE = biasProperty("bth.packdepthscale", 1.03F, 1.0F, 1.2F);
+
+    private static float biasProperty(String name, float fallback, float min, float max) {
+        try {
+            return Math.max(min, Math.min(max, Float.parseFloat(System.getProperty(name, Float.toString(fallback)))));
+        } catch (NumberFormatException e) {
+            return fallback;
+        }
+    }
     private static final Identifier SHADER = Identifier.fromNamespaceAndPath(BeyondTheHorizonConstants.MOD_ID, "core/lod_terrain");
 
     private static RenderPipeline.Builder base(String name, String... defines) {
@@ -105,7 +142,7 @@ public final class LodRenderer {
     private static final CompareOp FORWARD = CompareOp.LESS_THAN_OR_EQUAL;
 
     /** The ground blends the colors between vertices; the pixelated one reads them on a finer grid, with noise. */
-    public static final RenderPipeline GROUND = ground("lod_ground");
+    public static final RenderPipeline GROUND = ground("lod_ground", "NOISE");
     public static final RenderPipeline WATER = water("lod_water");
     /** The ground drawn into the depth only (transparent, with the blend keeping the color), for what vanilla draws after the terrain: the clouds. */
     public static final RenderPipeline GROUND_DEPTH = RenderPipelines.registerOptional(
@@ -117,7 +154,7 @@ public final class LodRenderer {
     );
     public static final RenderPipeline GROUND_PIXEL = ground("lod_ground_pixel", "PIXEL_COLOR");
     /** The stepped columns: flat colors with the faces wound outward (see MeshBuilder.steps), so what faces away is culled. */
-    public static final RenderPipeline STEPS = ground("lod_steps");
+    public static final RenderPipeline STEPS = ground("lod_steps", "STEPPED", "NOISE");
     /** The approximated trees: flat shapes seen from both sides. */
     public static final RenderPipeline TREES = RenderPipelines.registerOptional(
         base("lod_trees", "SPRITES").withCull(false).withColorTargetState(ColorTargetState.DEFAULT).withDepthStencilState(DepthStencilState.DEFAULT).build()
@@ -127,7 +164,7 @@ public final class LodRenderer {
         base("lod_ground_forward").withColorTargetState(ColorTargetState.DEFAULT).withDepthStencilState(new DepthStencilState(FORWARD, true)).build()
     );
     public static final RenderPipeline STEPS_FORWARD = RenderPipelines.registerOptional(
-        base("lod_steps_forward").withColorTargetState(ColorTargetState.DEFAULT).withDepthStencilState(new DepthStencilState(FORWARD, true)).build()
+        base("lod_steps_forward", "STEPPED").withColorTargetState(ColorTargetState.DEFAULT).withDepthStencilState(new DepthStencilState(FORWARD, true)).build()
     );
     public static final RenderPipeline TREES_FORWARD = RenderPipelines.registerOptional(
         base("lod_trees_forward", "SPRITES").withCull(false).withColorTargetState(ColorTargetState.DEFAULT).withDepthStencilState(new DepthStencilState(FORWARD, true)).build()
@@ -149,12 +186,29 @@ public final class LodRenderer {
     private final LodManager manager;
     private final LodFog fog = new LodFog();
     private final Matrix4f projection = new Matrix4f();
+    /** The view rotation of the terrain under a shader pack: scaled about the camera, see {@link #PACK_DEPTH_SCALE}. */
+    private final Matrix4f packView = new Matrix4f();
+    /** Without a pack, in the place of the texture matrix: the square of vanilla's chunks, seen from the camera, for the shader to cut out. */
+    private final Matrix4f ownBounds = new Matrix4f();
+    /**
+     * Under a shader pack the terrain's own shader (which leaves out what lies inside the square of vanilla's chunks, fragment by
+     * fragment) is replaced by the pack's, so the cells that lie wholly inside the square are left out of the draw calls instead, for the
+     * tiles that stand partly in it. The square, in blocks, as of this frame; {@link #cutActive} when there is one to cut by.
+     */
+    private boolean cutActive;
+    private double cutX0;
+    private double cutX1;
+    private double cutZ0;
+    private double cutZ1;
     private final Matrix4f cull = new Matrix4f();
     private final Matrix4f identity = new Matrix4f();
     private final List<Vector4f> mods = new ArrayList<>();
     private final FrustumIntersection frustum = new FrustumIntersection();
     private final List<Vector3f> offsets = new ArrayList<>();
     private @Nullable ProjectionMatrixBuffer projectionBuffer;
+    /** The far planes last written to the log (debug), so that it says something only when they change. */
+    private float loggedCameraFar = Float.NaN;
+    private float loggedFar = Float.NaN;
     private @Nullable GpuBuffer sharedIndices;
     private boolean failed;
     // What this frame's terrain pass drew, for the depth pass that follows it, see renderDepth.
@@ -182,6 +236,11 @@ public final class LodRenderer {
 
     public LodRenderer(LodManager manager) {
         this.manager = manager;
+    }
+
+    /** A coordinate modulo 4096 as a float: the noise's grain is fixed to the world with it, without the precision a far coordinate loses. */
+    private static float modulo4096(double v) {
+        return (float) (v - Math.floor(v / 4096.0) * 4096.0);
     }
 
     public boolean shouldRender(CameraRenderState camera) {
@@ -215,7 +274,7 @@ public final class LodRenderer {
         CompiledRenderPipeline pixelGround = pixel > 0 && !BeyondTheHorizonDebug.NO_PIXEL ? this.compiled(GROUND_PIXEL) : null;
         CompiledRenderPipeline ground = pixelGround != null ? pixelGround : smoothGround;
         // The tree sprites are cut out by the terrain shader (alpha codes), which the pack program does not do: no trees under a pack.
-        CompiledRenderPipeline trees = cfg.treeLevel > 0 && !shaderPack ? this.compiled(forwardZ ? TREES_FORWARD : TREES) : null;
+        CompiledRenderPipeline trees = cfg.trees && !shaderPack ? this.compiled(forwardZ ? TREES_FORWARD : TREES) : null;
         CompiledRenderPipeline water = this.compiled(forwardZ ? WATER_FORWARD : WATER);
         CompiledRenderPipeline stepPipeline = this.compiled(forwardZ ? STEPS_FORWARD : STEPS);
         if (ground == null || water == null || target.getDepthTextureView() == null || minecraft.level == null) {
@@ -225,14 +284,36 @@ public final class LodRenderer {
         double camY = camera.pos.y;
         double camZ = camera.pos.z;
         Matrix4f base = camera.projectionMatrix;
-        float fovY = 2.0F * (float) Math.atan(1.0 / base.m11());
-        float aspect = base.m11() / base.m00();
-        // The direction the camera looks in: minus the third row of the view rotation.
-        this.manager.setView(fovY, Math.toRadians(minecraft.options.fov().get()), aspect, -camera.viewRotationMatrix.m02(), -camera.viewRotationMatrix.m12(), -camera.viewRotationMatrix.m22());
+        // Read from the projection of this frame, so the field of view and its effects are in it: nothing is kept from an earlier frame.
+        // A projection that is not usable (zero or not finite) falls back to the option's fov and the window's shape.
+        boolean baseUsable = Float.isFinite(base.m11()) && Float.isFinite(base.m00()) && base.m11() > 1.0E-4F && base.m00() > 1.0E-4F;
+        float fovY = baseUsable ? 2.0F * (float) Math.atan(1.0 / base.m11()) : (float) Math.toRadians(minecraft.options.fov().get());
+        float aspect = baseUsable ? base.m11() / base.m00() : (float) minecraft.getWindow().getWidth() / Math.max(1, minecraft.getWindow().getHeight());
         boolean zeroToOne = RenderSystem.getDevice().getDeviceInfo().isZZeroToOne();
         // The depth runs backwards, as vanilla's: the far plane is given as the near one.
         float far = this.manager.activeLodDistance() * 2.0F + (float) Math.abs(camY) + 4096.0F;
-        if (forwardZ) {
+        // The far plane of the camera of this frame (the game's own projection, which a shader pack reads its depth with).
+        // The far plane is read from the projection itself (the camera's depthFar field may not follow the projection's far plane).
+        float cameraFar = Math.max(camera.depthFar, baseUsable ? projectionFar(base, zeroToOne, forwardZ) : 0.0F);
+        if (BeyondTheHorizonDebug.ENABLED) {
+            this.logFarNames(camera);
+        }
+        boolean cameraFarKnown = cameraFar > 0.0F && Float.isFinite(cameraFar);
+        if (shaderPack && cameraFarKnown) {
+            // The game's projection has its far plane out at the end of the terrain (ProjectionFarMixin): the same one is used, so
+            // the depth written here is the depth the pack reads back.
+            far = Math.max(far, cameraFar);
+        }
+        if (BeyondTheHorizonDebug.ENABLED && shaderPack && (cameraFar != this.loggedCameraFar || far != this.loggedFar)) {
+            this.loggedCameraFar = cameraFar;
+            this.loggedFar = far;
+            LOGGER.info("[BTH pack depth] camera.depthFar={} (used {}; known: {}), terrain far={}, packFar={}, projection from camera: {}", camera.depthFar, cameraFar, cameraFarKnown, far, this.manager.packFar(), !forwardZ && cameraFarKnown && cameraFar >= far);
+        }
+        if (shaderPack && !forwardZ && cameraFarKnown && cameraFar >= far) {
+            // The camera's projection reaches as far as the terrain: it is the projection of the terrain, value for value, so that
+            // the depth of a pixel of the terrain is exactly what the pack takes it for (its fog, and no sky where there is terrain).
+            this.projection.set(base);
+        } else if (forwardZ) {
             this.projection.setPerspective(fovY, aspect, 0.05F, far, zeroToOne);
         } else {
             this.projection.setPerspective(fovY, aspect, far, 0.05F, zeroToOne);
@@ -251,8 +332,32 @@ public final class LodRenderer {
             this.distance = new double[list.length];
             this.horizontal = new double[list.length];
         }
+        // The square of vanilla's chunks around the camera of this frame, worked out once: a tile lying wholly inside it is under what
+        // vanilla draws and is left out with four comparisons, before anything else is done with it (the planner does the same with the
+        // camera of its last tick; the camera has moved on since).
+        int ownHalf = this.manager.ownHalf();
+        double ownX0 = 0.0;
+        double ownX1 = 0.0;
+        double ownZ0 = 0.0;
+        double ownZ1 = 0.0;
+        if (ownHalf >= 1) {
+            int chunkX = (int) Math.floor(camX) >> 4;
+            int chunkZ = (int) Math.floor(camZ) >> 4;
+            ownX0 = (chunkX - ownHalf) * 16.0;
+            ownX1 = (chunkX + ownHalf + 1) * 16.0;
+            ownZ0 = (chunkZ - ownHalf) * 16.0;
+            ownZ1 = (chunkZ + ownHalf + 1) * 16.0;
+        }
+        this.cutActive = shaderPack && ownX1 > ownX0 && !BeyondTheHorizonDebug.NO_PACK_CUT;
+        this.cutX0 = ownX0;
+        this.cutX1 = ownX1;
+        this.cutZ0 = ownZ0;
+        this.cutZ1 = ownZ1;
         int count = 0;
         for (Tile tile : list) {
+            if (ownX1 > ownX0 && tile.minX >= ownX0 && tile.minZ >= ownZ0 && tile.minX + tile.size <= ownX1 && tile.minZ + tile.size <= ownZ1) {
+                continue;
+            }
             float x0 = (float) (tile.minX - camX);
             float z0 = (float) (tile.minZ - camZ);
             float y0 = (float) (tile.minY - camY);
@@ -284,6 +389,21 @@ public final class LodRenderer {
         }
         sortByDistance(this.visible, this.distance, this.horizontal, count);
 
+        // The view of the terrain and the matrix in the place of the texture matrix, the same for every tile.
+        if (shaderPack) {
+            this.packView.set(camera.viewRotationMatrix).scaleLocal(PACK_DEPTH_SCALE, PACK_DEPTH_SCALE, PACK_DEPTH_SCALE);
+        } else {
+            // The first column: x0, z0, x1, z1 of the square of vanilla's chunks, from the camera; all zero (nothing cut out) when there is none.
+            this.ownBounds.zero();
+            if (ownX1 > ownX0) {
+                this.ownBounds.m00((float) (ownX0 - camX)).m01((float) (ownZ0 - camZ)).m02((float) (ownX1 - camX)).m03((float) (ownZ1 - camZ));
+            }
+            // The second column: the camera's place modulo 4096, which puts the noise's grain in the world (lod_terrain.vsh: noisePos).
+            this.ownBounds.m10(modulo4096(camX)).m11(modulo4096(camY)).m12(modulo4096(camZ));
+        }
+        Matrix4f terrainView = shaderPack ? this.packView : camera.viewRotationMatrix;
+        Matrix4f terrainTexture = shaderPack ? this.identity : this.ownBounds;
+        double vanillaRangeBlocks = minecraft.options.getEffectiveRenderDistance() * 16.0;
         // One transform per tile: where its corner is, seen from the camera.
         DynamicGpuData.Transform[] transforms = this.transformArray(count);
         while (this.offsets.size() < count) {
@@ -298,16 +418,23 @@ public final class LodRenderer {
             // noise to it. A shader pack's program (Iris) does multiply the vertex color by it, so under a pack it is plain white.
             Vector4f mod = this.mods.get(i);
             if (shaderPack) {
-                mod.set(1.0F, 1.0F, 1.0F, 1.0F);
+                // The pack multiplies its vertex color by this: the terrain is dimmed to PACK_NEAR_EXPOSURE where it meets vanilla's chunks,
+                // fading to PACK_FAR_EXPOSURE at the end of the terrain.
+                double span = Math.max(1.0, this.manager.activeLodDistance() - vanillaRangeBlocks);
+                double t = Math.max(0.0, Math.min(1.0, (this.distance[i] - vanillaRangeBlocks) / span));
+                float exposure = PACK_NEAR_EXPOSURE + (PACK_FAR_EXPOSURE - PACK_NEAR_EXPOSURE) * (float) (t * t * (3.0 - 2.0 * t));
+                mod.set(exposure, exposure, exposure, 1.0F);
             } else {
-                mod.set(0.0F, (float) (tile.size / MeshBuilder.CELLS) / Math.max(1, pixel), PIXEL_NOISE, 1.0F);
+                // y: the size of a cell of the pixel filter and of the noise, z: the noise (off with the pixel filter), w: whether the
+                // render-distance fog is round (1) or cylindrical (0), see lod_terrain.fsh.
+                mod.set(0.0F, (float) (tile.size / MeshBuilder.CELLS) / Math.max(1, pixel), pixel > 0 ? PIXEL_NOISE : 0.0F, this.fog.round ? 1.0F : 0.0F);
             }
-            transforms[i] = new DynamicGpuData.Transform(camera.viewRotationMatrix, mod, offset, this.identity);
+            transforms[i] = new DynamicGpuData.Transform(terrainView, mod, offset, terrainTexture);
         }
         GpuBufferSlice[] slices = RenderSystem.getDynamicUniforms().writeTransforms(transforms);
         // The same again for the trees, with the distance of vanilla's chunks in the modulator: the shader leaves out what
         // lies inside it, per fragment, so a tile that stands half in it still shows its trees on the far half.
-        double vanillaRange = minecraft.options.getEffectiveRenderDistance() * 16.0;
+        double vanillaRange = vanillaRangeBlocks;
         // Only the tiles that have trees get one: most tiles have none, and each one is a write to the uniform buffer.
         if (this.treeSlot.length < count) {
             this.treeSlot = new int[count];
@@ -456,8 +583,9 @@ public final class LodRenderer {
                     (tile.part.offset + tile.waterIndexOffset) / 2, tile.waterIndexCount);
             }
         }
-        // Vanilla draws over the terrain with a depth buffer of its own.
-        if (!BeyondTheHorizonDebug.NO_CLEAR) {
+        // Vanilla draws over the terrain with a depth buffer of its own. Under a shader pack the terrain's depth stays: the pack fogs and
+        // shades by it (a pixel without depth is the sky to it), and the terrain is drawn a little lower, see PACK_LOWER, so vanilla's chunks win.
+        if (!BeyondTheHorizonDebug.NO_CLEAR && (!shaderPack || BeyondTheHorizonDebug.PACK_CLEAR)) {
             encoder.clearDepthTexture(target.getDepthTexture(), 0.0);
         }
         PerfStats.add(PerfStats.Timer.TERRAIN, System.nanoTime() - passStart);
@@ -626,12 +754,109 @@ public final class LodRenderer {
             Tile tile = this.visible[i];
             pass.setUniform("DynamicTransforms", slices[i]);
             if (tile.ownGroundIndexOffset < 0) {
-                this.drawTile(pass, tile, 0, MeshBuilder.GROUND_VERTICES * MeshBuilder.VERTEX_SIZE, shared, 0, MeshBuilder.SHARED_INDEX_COUNT);
+                if (!this.cutActive || !this.drawCut(pass, tile, shared)) {
+                    this.drawTile(pass, tile, 0, MeshBuilder.GROUND_VERTICES * MeshBuilder.VERTEX_SIZE, shared, 0, MeshBuilder.SHARED_INDEX_COUNT);
+                }
             } else {
                 this.drawTile(pass, tile, 0, MeshBuilder.GROUND_VERTICES * MeshBuilder.VERTEX_SIZE, tile.part.buffer,
                     (tile.part.offset + tile.ownGroundIndexOffset) / 2, tile.groundIndexCount);
             }
         }
+    }
+
+    private boolean loggedFarNames;
+
+    /**
+     * Debug only: once, the names in the game that have to do with the far plane and the projection, so that the hook that raises the far
+     * plane (ProjectionFarMixin) can be put where the game really sets it. Looked up by name, so nothing here can fail to compile.
+     */
+    private void logFarNames(Object cameraState) {
+        if (this.loggedFarNames) {
+            return;
+        }
+        this.loggedFarNames = true;
+        try {
+            for (Class<?> type : new Class<?>[] {Class.forName("net.minecraft.client.renderer.GameRenderer"), cameraState.getClass(), Class.forName("net.minecraft.client.Camera")}) {
+                StringBuilder names = new StringBuilder();
+                for (java.lang.reflect.Method method : type.getDeclaredMethods()) {
+                    String name = method.getName().toLowerCase(java.util.Locale.ROOT);
+                    if (name.contains("far") || name.contains("depth") || name.contains("projection") || name.contains("renderdistance")) {
+                        names.append(method.getReturnType().getSimpleName()).append(' ').append(method.getName()).append(java.util.Arrays.toString(method.getParameterTypes())).append("; ");
+                    }
+                }
+                StringBuilder fields = new StringBuilder();
+                for (java.lang.reflect.Field field : type.getDeclaredFields()) {
+                    String name = field.getName().toLowerCase(java.util.Locale.ROOT);
+                    if (name.contains("far") || name.contains("depth") || name.contains("projection") || name.contains("renderdistance")) {
+                        fields.append(field.getType().getSimpleName()).append(' ').append(field.getName()).append("; ");
+                    }
+                }
+                LOGGER.info("[BTH names] {}: methods {} fields {}", type.getName(), names, fields);
+            }
+        } catch (ReflectiveOperationException | RuntimeException e) {
+            LOGGER.info("[BTH names] could not list: {}", e.toString());
+        }
+    }
+
+    /**
+     * Draws a tile with the shared triangles without the cells that lie wholly inside the square of vanilla's chunks, and without the
+     * skirt along an edge cell that is left out: a skirt there would stand over vanilla's ground as a wall. The cells are in rows, so what
+     * is left is a few ranges of the shared indices. False when no cell lies inside (the tile is then drawn whole by the caller).
+     */
+    private boolean drawCut(RenderPass pass, Tile tile, GpuBuffer shared) {
+        int cells = MeshBuilder.CELLS;
+        double cell = tile.size / cells;
+        int x0 = clampCell((int) Math.ceil((this.cutX0 - tile.minX) / cell), cells);
+        int x1 = clampCell((int) Math.floor((this.cutX1 - tile.minX) / cell), cells);
+        int z0 = clampCell((int) Math.ceil((this.cutZ0 - tile.minZ) / cell), cells);
+        int z1 = clampCell((int) Math.floor((this.cutZ1 - tile.minZ) / cell), cells);
+        if (x1 <= x0 || z1 <= z0) {
+            return false;
+        }
+        int bytes = MeshBuilder.GROUND_VERTICES * MeshBuilder.VERTEX_SIZE;
+        // The rows above the square and the left part of its first row.
+        int end = (z0 * cells + x0) * 6;
+        if (end > 0) {
+            this.drawTile(pass, tile, 0, bytes, shared, 0, end);
+        }
+        // From the right of the square in one row to its left in the next, one range for each row of the square.
+        for (int row = z0; row < z1 - 1; row++) {
+            int from = (row * cells + x1) * 6;
+            int to = ((row + 1) * cells + x0) * 6;
+            if (to > from) {
+                this.drawTile(pass, tile, 0, bytes, shared, from, to - from);
+            }
+        }
+        // The right of the square in its last row, and the rows below it.
+        int from = ((z1 - 1) * cells + x1) * 6;
+        int total = cells * cells * 6;
+        if (total > from) {
+            this.drawTile(pass, tile, 0, bytes, shared, from, total - from);
+        }
+        // The skirts: each is along one edge cell; a run of kept ones is one range.
+        int skirts = total;
+        for (int edge = 0; edge < 4; edge++) {
+            int run = -1;
+            for (int i = 0; i <= cells; i++) {
+                boolean keep = false;
+                if (i < cells) {
+                    int cx = edge == 2 ? 0 : edge == 3 ? cells - 1 : i;
+                    int cz = edge == 0 ? 0 : edge == 1 ? cells - 1 : i;
+                    keep = !(cx >= x0 && cx < x1 && cz >= z0 && cz < z1);
+                }
+                if (keep && run < 0) {
+                    run = i;
+                } else if (!keep && run >= 0) {
+                    this.drawTile(pass, tile, 0, bytes, shared, skirts + (edge * cells + run) * 6, (i - run) * 6);
+                    run = -1;
+                }
+            }
+        }
+        return true;
+    }
+
+    private static int clampCell(int value, int cells) {
+        return Math.max(0, Math.min(cells, value));
     }
 
     /**
@@ -695,7 +920,7 @@ public final class LodRenderer {
             LOGGER.error("Pipeline {} failed to load", pipeline.getLocation(), e);
         }
         if (compiled == null) {
-            LOGGER.error("The shaders of the distant terrain are not supported by this graphics driver, it is turned off");
+            LOGGER.error("The shaders of the Heightmap LOD are not supported by this graphics driver, it is turned off");
             this.failed = true;
         }
         return compiled;
@@ -827,5 +1052,22 @@ public final class LodRenderer {
             this.sharedIndices.close();
             this.sharedIndices = null;
         }
+    }
+
+    /**
+     * The far plane a perspective matrix was made with (near plane 0.05, as vanilla's), worked out from its depth terms; 0 where it is
+     * not usable. Reverse depth (far given as near) or forward, zero-to-one or minus-one-to-one: the four forms of JOML's setPerspective.
+     */
+    private static float projectionFar(Matrix4f m, boolean zeroToOne, boolean forward) {
+        float m22 = m.m22();
+        float m32 = m.m32();
+        float near = 0.05F;
+        float far;
+        if (forward) {
+            far = zeroToOne ? m32 / (m22 + 1.0F) : near * (m22 - 1.0F) / (m22 + 1.0F);
+        } else {
+            far = zeroToOne ? m32 / m22 : near * (m22 + 1.0F) / (m22 - 1.0F);
+        }
+        return Float.isFinite(far) && far > 0.0F ? far : 0.0F;
     }
 }

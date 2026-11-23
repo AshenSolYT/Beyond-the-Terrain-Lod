@@ -84,10 +84,16 @@ public class LodConfigScreen extends OptionsSubScreen {
         // 0 off, then 2x2, 4x4 and 8x8.
         this.list.addBig(slider("pixel_filter", 0, 3, c.pixelFilter == 0 ? 0 : Integer.numberOfTrailingZeros(c.pixelFilter),
             v -> v == 0 ? Component.translatable(PREFIX + "off") : Component.literal((1 << v) + "x" + (1 << v)), v -> c.pixelFilter = v == 0 ? 0 : 1 << v));
-        this.list.addBig(slider("step_level", 0, 5, c.stepLevel + 1, v -> v == 0 ? Component.translatable(PREFIX + "off") : Component.literal((1 << (v - 1)) + " " + Component.translatable(PREFIX + "blocks").getString()), v -> c.stepLevel = v - 1));
-        this.list.addBig(slider("tree_level", 0, 4, c.treeLevel, v -> v == 0 ? Component.translatable(PREFIX + "off") : Component.literal((1 << v) + " " + Component.translatable(PREFIX + "blocks").getString()), v -> c.treeLevel = v));
+        this.list.addBig(OptionInstance.createBoolean(
+            PREFIX + "block_heightmap", OptionInstance.cachedConstantTooltip(Component.translatable(PREFIX + "block_heightmap.tooltip")), c.blockHeightmap, v -> c.blockHeightmap = v
+        ));
+        this.list.addBig(OptionInstance.createBoolean(
+            PREFIX + "trees", OptionInstance.cachedConstantTooltip(Component.translatable(PREFIX + "trees.tooltip")), c.trees, v -> c.trees = v
+        ));
+        // In chunks: how far the Block Heightmap columns and the box trees reach.
+        this.list.addBig(slider("block_heightmap_distance", 2, 128, c.blockHeightmapDistance / 16, v -> Component.literal(v + " " + Component.translatable(PREFIX + "chunks").getString()), v -> c.blockHeightmapDistance = v * 16));
+        this.list.addBig(slider("tree_distance", 2, 256, c.treeDistance / 16, v -> Component.literal(v + " " + Component.translatable(PREFIX + "chunks").getString()), v -> c.treeDistance = v * 16));
         this.list.addBig(slider("tree_density", 10, 200, c.treeDensity, v -> Component.literal(v + " %"), v -> c.treeDensity = v));
-        this.list.addBig(slider("tree_billboard", 0, 5, c.treeBillboardLevel, v -> v == 5 ? Component.translatable(PREFIX + "off") : Component.literal((1 << v) + " " + Component.translatable(PREFIX + "blocks").getString()), v -> c.treeBillboardLevel = v));
         this.list.addBig(Button.builder(Component.translatable(PREFIX + "clear_cache"), button -> {
             BeyondTheHorizonClient.manager().reloadAll();
             button.setMessage(Component.translatable(PREFIX + "clear_cache.done"));

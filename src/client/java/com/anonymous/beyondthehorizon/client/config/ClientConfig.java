@@ -42,13 +42,19 @@ public final class ClientConfig {
     /** Every triangle of the terrain has one color, so the ground looks like blocks, not like a smooth blend. */
     /** The pixelated filter: the smooth colors read on a grid this many times finer than the terrain samples, with a little noise. 0 is off, else 2, 4 or 8. */
     public int pixelFilter = 0;
-    /** Trees (approximated) are drawn on tiles with a sample spacing up to 2 to this power in blocks; 0 is off. */
-    public int treeLevel = 2;
+    /** Trees (approximated) on or off: boxes within {@link #treeDistance}, billboard sprites beyond it. */
+    public boolean trees = true;
     public int treeDensity = 100;
-    /** Trees on tiles with a sample spacing of 2 to this power blocks or more are one billboard sprite instead of boxes; 5 is off (no tree tiles are coarser). */
-    public int treeBillboardLevel = 2;
-    /** Tiles with a sample spacing up to 2 to this power in blocks are drawn as stepped columns (flat tops, walls between them) instead of the smooth ground; 0 is one block per column, -1 is off. */
-    public int stepLevel = 3;
+    /** Block Heightmap on or off: the finest tiles (up to LodHeightmap.MAX_STEP_LEVEL) within {@link #blockHeightmapDistance} are columns (flat tops, walls between them) instead of the smooth ground. */
+    public boolean blockHeightmap = true;
+    /**
+     * How far from the camera tiles may be drawn as Block Heightmap columns, in blocks. Independent of the sample spacing above (the detail) and
+     * of how soon tiles split (sharpness): the planner keeps the tiles within this distance as fine as the columns need (spacing 2), so
+     * this distance alone decides how far the Block Heightmap reaches. More distance means many more tiles to load and draw.
+     */
+    public int blockHeightmapDistance = 512;
+    /** How far from the camera the trees are boxes, in blocks; beyond it they are billboard sprites. */
+    public int treeDistance = 1024;
 
     public int distanceBlocks() {
         return this.distanceChunks * 16;
@@ -89,10 +95,14 @@ public final class ClientConfig {
                 config.fogStartPercent = number(p, "fogStartPercent", config.fogStartPercent);
                 config.waterFog = Boolean.parseBoolean(p.getProperty("waterFog", "true"));
                 config.pixelFilter = number(p, "pixelFilter", config.pixelFilter);
-                config.treeLevel = number(p, "treeLevel", config.treeLevel);
+                // Before 0.8.16 the trees and the Block Heightmap were levels: 0 (or -1) was off.
+                config.trees = p.containsKey("trees") ? Boolean.parseBoolean(p.getProperty("trees")) : number(p, "treeLevel", 2) > 0;
                 config.treeDensity = number(p, "treeDensity", config.treeDensity);
-                config.treeBillboardLevel = number(p, "treeBillboardLevel", config.treeBillboardLevel);
-                config.stepLevel = number(p, "stepSpacing", config.stepLevel);
+                // Before 0.8.12 these were "stepSpacing" and "stepDistance" (the stepped terrain, now the Block Heightmap).
+                config.blockHeightmap = p.containsKey("blockHeightmap") ? Boolean.parseBoolean(p.getProperty("blockHeightmap"))
+                    : (p.containsKey("blockHeightmapLevel") ? number(p, "blockHeightmapLevel", 3) : number(p, "stepSpacing", 3)) >= 0;
+                config.blockHeightmapDistance = p.containsKey("blockHeightmapDistance") ? number(p, "blockHeightmapDistance", config.blockHeightmapDistance) : number(p, "stepDistance", config.blockHeightmapDistance);
+                config.treeDistance = number(p, "treeDistance", config.treeDistance);
             } catch (IOException | RuntimeException e) {
                 LOGGER.warn("Could not read {}, using defaults", path, e);
             }
@@ -117,10 +127,9 @@ public final class ClientConfig {
         this.fogMode = Mth.clamp(this.fogMode, 0, 3);
         this.fogStartPercent = Mth.clamp(this.fogStartPercent, 0, 99);
         this.pixelFilter = this.pixelFilter >= 8 ? 8 : this.pixelFilter >= 4 ? 4 : this.pixelFilter >= 2 ? 2 : 0;
-        this.treeLevel = Mth.clamp(this.treeLevel, 0, 4);
         this.treeDensity = Mth.clamp(this.treeDensity, 10, 200);
-        this.treeBillboardLevel = Mth.clamp(this.treeBillboardLevel, 0, 5);
-        this.stepLevel = Mth.clamp(this.stepLevel, -1, 4);
+        this.blockHeightmapDistance = Mth.clamp(this.blockHeightmapDistance, 32, 2048);
+        this.treeDistance = Mth.clamp(this.treeDistance, 32, 4096);
     }
 
     public void save() {
@@ -134,10 +143,11 @@ public final class ClientConfig {
         p.setProperty("fogStartPercent", Integer.toString(this.fogStartPercent));
         p.setProperty("waterFog", Boolean.toString(this.waterFog));
         p.setProperty("pixelFilter", Integer.toString(this.pixelFilter));
-        p.setProperty("treeLevel", Integer.toString(this.treeLevel));
+        p.setProperty("trees", Boolean.toString(this.trees));
         p.setProperty("treeDensity", Integer.toString(this.treeDensity));
-        p.setProperty("treeBillboardLevel", Integer.toString(this.treeBillboardLevel));
-        p.setProperty("stepSpacing", Integer.toString(this.stepLevel));
+        p.setProperty("blockHeightmap", Boolean.toString(this.blockHeightmap));
+        p.setProperty("blockHeightmapDistance", Integer.toString(this.blockHeightmapDistance));
+        p.setProperty("treeDistance", Integer.toString(this.treeDistance));
         try (Writer out = Files.newBufferedWriter(path())) {
             p.store(out, "Beyond the Terrain client settings");
         } catch (IOException e) {

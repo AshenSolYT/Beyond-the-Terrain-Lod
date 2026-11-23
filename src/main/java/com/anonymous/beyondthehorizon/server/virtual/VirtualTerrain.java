@@ -344,7 +344,7 @@ public final class VirtualTerrain {
             long taskCpu = PERF ? THREADS.getCurrentThreadCpuTime() : 0L;
             int index = (1 + i % innerX) + (1 + i / innerX) * sizeX;
             ProtoChunk chunk = area[index];
-            WorkThrottle.yieldToFrames();
+            WorkThrottle.checkpoint();
             long referencesCpu = PERF ? THREADS.getCurrentThreadCpuTime() : 0L;
             this.addReferences(chunks, chunk);
             if (PERF) {
@@ -376,7 +376,7 @@ public final class VirtualTerrain {
                 long taskCpu = PERF ? THREADS.getCurrentThreadCpuTime() : 0L;
                 int x = 2 + offsetX + (i % countX) * 3;
                 int z = 2 + offsetZ + (i / countX) * 3;
-                WorkThrottle.yieldToFrames();
+                WorkThrottle.checkpoint();
                 this.decorate(chunks, area[x + z * sizeX]);
                 if (PERF) {
                     PERF_DECORATE_NANOS.addAndGet(THREADS.getCurrentThreadCpuTime() - taskCpu);

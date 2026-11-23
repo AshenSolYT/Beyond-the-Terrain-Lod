@@ -1,6 +1,7 @@
 package com.anonymous.beyondthehorizon.client.lod;
 
 import com.anonymous.beyondthehorizon.BeyondTheHorizonConstants;
+import com.anonymous.beyondthehorizon.BeyondTheHorizonDebug;
 import com.anonymous.beyondthehorizon.client.color.TileColors;
 import com.anonymous.beyondthehorizon.tile.TileData;
 import com.anonymous.beyondthehorizon.tile.TilePos;
@@ -50,7 +51,13 @@ public final class TileMesher {
 
     private static final ThreadLocal<Scratch> SCRATCH = ThreadLocal.withInitial(Scratch::new);
 
-    public static MeshBuilder.@Nullable Mesh mesh(TileData data, TilePos pos, Registry<Biome> biomes, int seaLevel, int treeLevel, int treeDensity, int billboardLevel, int stepLevel) {
+    /** Trees are planted on tiles with a sample spacing up to this, in blocks; coarser tiles are too coarse for a tree. */
+    private static final int TREE_MAX_SPACING = 32;
+    /** Trees on tiles with a sample spacing above this are always billboards: boxes are for the near, fine tiles. */
+    private static final int BOX_TREE_MAX_SPACING = 8;
+
+    public static MeshBuilder.@Nullable Mesh mesh(TileData data, TilePos pos, Registry<Biome> biomes, int seaLevel, boolean treesOn, int treeDensity, boolean blockOn,
+        double distance, int treeDistance, int blockDistance) {
         int spacing = BeyondTheHorizonConstants.tileSize(pos.level()) / BeyondTheHorizonConstants.TILE_CELLS;
         List<Holder<Biome>> palette = new ArrayList<>(data.palette.size());
         for (Identifier id : data.palette) {
@@ -79,6 +86,10 @@ public final class TileMesher {
             } else {
                 ground[i] = height;
             }
+        }
+        // The coarser tiles' whole-block heights are smoothed (LodHeightmap), before anything is worked out from the slope of the ground.
+        if (!BeyondTheHorizonDebug.NO_SMOOTH) {
+            LodHeightmap.smooth(ground, voids, water, spacing);
         }
         // Colors, from the slope of the ground at each sample.
         int[] colors = work.colors;
@@ -158,10 +169,13 @@ public final class TileMesher {
                 }
             }
         }
-        TreePlanter.Trees trees = treeLevel > 0 && spacing <= 1 << treeLevel
-            ? TreePlanter.plant(data, pos, spacing, ground, voids, water, colors, treeDensity, palette, billboardLevel < 5 && spacing >= 1 << billboardLevel)
+        // Trees: boxes while the tile is within the tree distance (and fine enough for boxes), billboard sprites beyond it.
+        boolean billboards = spacing > BOX_TREE_MAX_SPACING || (distance >= 0.0 && distance > treeDistance);
+        boolean stepped = blockOn && spacing <= 1 << LodHeightmap.MAX_STEP_LEVEL && (distance < 0.0 || distance <= blockDistance);
+        TreePlanter.Trees trees = treesOn && spacing <= TREE_MAX_SPACING
+            ? TreePlanter.plant(data, pos, spacing, ground, voids, water, colors, treeDensity, palette, billboards, stepped)
             : null;
-        return MeshBuilder.build(new MeshBuilder.Input(spacing, ground, colors, voids, anyWater ? water : null, waterColors, waterLevel, trees, stepLevel >= 0 && spacing <= 1 << stepLevel));
+        return MeshBuilder.build(new MeshBuilder.Input(spacing, ground, colors, voids, anyWater ? water : null, waterColors, waterLevel, trees, stepped));
     }
 
     /** The block the server's surface rules put on sample {@code i}, or null when the tile does not say. */

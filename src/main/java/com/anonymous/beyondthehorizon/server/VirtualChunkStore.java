@@ -273,7 +273,7 @@ final class VirtualChunkStore {
                 }
             }
             if (minX <= maxX) {
-                WorkThrottle.yieldToFrames();
+                WorkThrottle.checkpoint();
                 waitForServer(level);
                 long start = ServerPerf.ON ? System.nanoTime() : 0L;
                 ProtoChunk[] made;

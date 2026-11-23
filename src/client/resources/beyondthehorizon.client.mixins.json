@@ -8,9 +8,11 @@
     "AtmosphericFogEnvironmentMixin",
     "DebugScreenEntriesMixin",
     "FogRendererMixin",
+    "IrisCameraUniformsMixin",
     "KeyboardHandlerMixin",
     "LevelRendererClearColorMixin",
     "LevelRendererMixin",
+    "ProjectionFarMixin",
     "SpriteContentsAccessor",
     "VideoSettingsScreenMixin"
   ],
