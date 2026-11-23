@@ -48,7 +48,7 @@ See your terrain well... beyond your terrain with a performance cost that depend
 ## Shader packs
 
 Works with Iris shader packs, Sodium and Iris are not required
-But shader pack lighting on LODs are not perfect
+Also shader pack lighting on LODs isn't perfect
 
 * Tested by Aadiel: Nostalgia, Photon, Solas, Iteration and Rethinking Voxels
 * Tested by me: SuperDuperVanilla, Complementary and Vanilla Plus, but the fps was bad because I have an iGPU
